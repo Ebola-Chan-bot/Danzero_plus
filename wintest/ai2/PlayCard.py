@@ -39,7 +39,6 @@ class PlayCard():
         return additionalActionList
 
     def FreePlay(self, handCards, curRank, fullActionList = None):
-        print("Free play handCards:", handCards, "   restHandsCount:", Strategy.restHandsCount)
         handValue, handActions = CountValue().HandCardsValue(handCards, 0, curRank)
         #print(handActions)
         #Strategy.SetBeginning(0)
@@ -88,7 +87,6 @@ class PlayCard():
                             (bestPlay == [] or CompareRank().Smaller(type, rank, card, bestPlay, curRank)))):
                             maxValue = thisHandValue + restValue
                             bestPlay = {"action": action, "type": type, "rank": rank}
-                            print(bestPlay, maxValue)
 
             #try additional list
             for action in additionalActionList:
@@ -112,14 +110,11 @@ class PlayCard():
                                 (bestPlay == [] or CompareRank().Smaller(type, rank, card, bestPlay, curRank)))):
                     maxValue = thisHandValue + restValue
                     bestPlay = {"action": action[2], "type": type, "rank": rank}
-                    print('Using additional action list')
-                    print(bestPlay, maxValue)
 
         #print("bestplay:",bestPlay, "handValue", handValue)
         return bestPlay
 
     def RestrictedPlay(self, handCards, formerAction, curRank, fullActionList = None):
-        print("Restricted Play handCards:", handCards,"   restHandsCount:", Strategy.restHandsCount)
         actionList = CreateActionList().CreateList(handCards)
 
         additionalActionList = self.GetAdditionalActionList(["Bomb", "StraightFlush", "ThreePair", "Straight"], curRank,
@@ -165,7 +160,6 @@ class PlayCard():
                         (bestPlay==[] or CompareRank().Smaller(type, rank, card, bestPlay, curRank)))):
                             maxValue = thisHandValue + restValue
                             bestPlay = {"action": action, "type": type, "rank": rank}
-                            print(maxValue, bestPlay)
 
         #try additional list
         for action in additionalActionList:
@@ -189,8 +183,6 @@ class PlayCard():
                                                 (bestPlay == [] or CompareRank().Smaller(type, rank, card, bestPlay, curRank)))):
                     maxValue = thisHandValue + restValue
                     bestPlay = {"action": action[2], "type": type, "rank": rank}
-                    print('Using additional action list')
-                    print(bestPlay, maxValue)
 
         if (bestPlay==[]):
             bestPlay = {'action': 'PASS', 'type': 'PASS', 'rank': 'PASS'}

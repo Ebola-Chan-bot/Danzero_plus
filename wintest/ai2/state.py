@@ -7,6 +7,76 @@
 from PlayCard import PlayCard
 from strategy import Strategy
 
+
+def _fmt_card(card: str) -> str:
+    suit_symbol = {"C": "♣", "D": "♦", "S": "♠", "H": "♥"}
+    if card in {"SB", "HR"}:
+        return "大JOKER" if card == "HR" else "小JOKER"
+    if not card:
+        return ""
+    s = card[0]
+    r = card[-1]
+    if r == "T":
+        r = "10"
+    return f"{suit_symbol.get(s, s)}{r}"
+
+
+def _fmt_action(action) -> str:
+    # action is expected like ['Pair','B',['SB','SB']] or ['PASS','PASS',[]]
+    if not action:
+        return ""
+    try:
+        typ = action[0]
+    except Exception:
+        return str(action)
+
+    type_ch = {
+        "Single": "单张",
+        "Pair": "对子",
+        "Trips": "三张",
+        "ThreePair": "三连对",
+        "ThreeWithTwo": "三带二",
+        "TwoTrips": "钢板",
+        "Straight": "顺子",
+        "StraightFlush": "同花顺",
+        "Bomb": "炸弹",
+        "PASS": "过",
+    }.get(typ, str(typ))
+
+    if typ == "PASS":
+        return type_ch
+
+    try:
+        cards = action[2]
+    except Exception:
+        cards = []
+    if cards == "PASS":
+        return type_ch
+    # Compress duplicates as ×n to reduce noise.
+    try:
+        from collections import Counter
+
+        cnt = Counter(cards) if isinstance(cards, list) else Counter()
+        ordered = []
+        seen = set()
+        if isinstance(cards, list):
+            for c in cards:
+                if c in seen:
+                    continue
+                seen.add(c)
+                ordered.append(c)
+        parts = []
+        for c in ordered:
+            n = int(cnt.get(c, 0))
+            if n <= 1:
+                parts.append(_fmt_card(c))
+            else:
+                parts.append(f"{_fmt_card(c)}×{n}")
+        cards_s = " ".join(parts)
+    except Exception:
+        cards_s = str(cards)
+    return f"{type_ch}: {cards_s}".strip()
+
 class State(object):
 
     def __init__(self):
@@ -87,7 +157,6 @@ class State(object):
             self._stage = None
             self._type = None
         except KeyError:
-            print(msg)
             raise KeyError
 
     def notify_begin(self):
@@ -106,7 +175,11 @@ class State(object):
         Strategy.SetBeginning(self._myPos, self._handCards)
         self._greaterPos = -1
         self._greaterAction = None
-        print("游戏开始, 我是{}号位，手牌：{}".format(self._myPos, self._handCards))
+        try:
+            n = len(self._handCards) if self._handCards is not None else 0
+        except Exception:
+            n = 0
+        print("游戏开始, 我是{}号位（手牌 {} 张）".format(self._myPos, n))
 
     def notify_play(self):
         """
@@ -124,7 +197,13 @@ class State(object):
         """
         # TODO: 选手可自行做出其他处理
         Strategy.UpdatePlay(self._curPos, self._curAction, self._greaterPos, self._greaterAction)
-        print("{}号位打出{}， 最大动作为{}号位打出的{}".format(self._curPos, self._curAction, self._greaterPos, self._greaterAction))
+        cur_s = _fmt_action(self._curAction)
+        greater_s = _fmt_action(self._greaterAction)
+        # If the current action is also the current maximum, avoid repeating it.
+        if self._curPos == self._greaterPos and self._curAction == self._greaterAction:
+            print("{}号位打出{}（当前最大）".format(self._curPos, cur_s))
+        else:
+            print("{}号位打出{}，当前最大 {}号位 {}".format(self._curPos, cur_s, self._greaterPos, greater_s))
 
     def notify_tribute(self):
         """
@@ -251,9 +330,21 @@ class State(object):
         请仅在对应的JSON格式下访问对应的实例属性，若此时访问其他属性则很有可能是之前处理时未更新的实例属性，不具有准确性。
         """
         # TODO: 选手可自行做出其他处理
-        print("当前动作为{}号-动作{}， 最大动作为{}号-动作{}，目前可选动作如下：".format(
-            self._curPos, self._curAction, self._greaterPos, self._greaterAction)
-        )
+        try:
+            act_cnt = len(self._actionList) if self._actionList is not None else 0
+        except Exception:
+            act_cnt = 0
+        # On lead (no greater action), don't print confusing None/-1/PASS info.
+        if Strategy.greaterPos == -1 or self._greaterPos == -1:
+            print("轮到我出牌（首出），可选动作 {} 个".format(act_cnt))
+        else:
+            print(
+                "轮到我出牌：当前最大 {}号位 {}；可选动作 {} 个".format(
+                    self._greaterPos,
+                    _fmt_action(self._greaterAction),
+                    act_cnt,
+                )
+            )
 
         if (Strategy.greaterPos == -1 or self._greaterPos==-1):
             Strategy.UpdateCurRank(self._curRank)

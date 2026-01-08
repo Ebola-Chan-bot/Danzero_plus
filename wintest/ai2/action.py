@@ -29,12 +29,10 @@ class Action(object):
 
     def GetIndexFromBack(self, msg, retValue): #"actionList": [['back', 'back', ['S2']], ['back', 'back', ['H2']]
         retIndex = 0
-        print("retValue:", retValue)
         retAction = retValue['action']
         for action in msg["actionList"]:
             if (action[2] == retAction):
                 retIndex = msg["actionList"].index(action)
-        print("选择动作：", retIndex, "动作为：", msg["actionList"][retIndex])
         return retIndex
 
     def GetIndexFromPlay(self, msg, retValue):
@@ -43,7 +41,6 @@ class Action(object):
         sortedAction = retValue["action"]
         if retValue["type"] != "PASS":
             sortedAction.sort()
-        print("retValue:",retValue)
         retIndex = 0
         for action in msg["actionList"]:
             if (action[2]!="PASS"): action[2].sort()
@@ -51,12 +48,9 @@ class Action(object):
             #print("actionfromlist:",action[0], action[1], action[2])
             if (action[0]==retValue["type"] and action[1]==retValue["rank"] and action[2]==sortedAction):
                 retIndex=msg["actionList"].index(action)
-        print("选择动作：", retIndex, "动作为：", msg["actionList"][retIndex])
         return retIndex
 
     def parse(self, msg):
         self.action = msg["actionList"]
         self.act_range = msg["indexRange"]
-        print(self.action)
-        print("可选动作范围为：0至{}".format(self.act_range))
         return randint(0, self.act_range)

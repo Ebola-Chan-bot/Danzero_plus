@@ -9,7 +9,14 @@ import pickle
 import torch
 import io
 from model import MLPActorCritic, MLPQNetwork
-from pyarrow import deserialize, serialize
+
+
+def _dumps(obj) -> bytes:
+    return pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
+
+
+def _loads(data: bytes):
+    return pickle.loads(data)
 
 ActionNumber = 2
 
@@ -32,6 +39,8 @@ parser.add_argument('--epsilon', type=float, default=0.01,
                     help='Epsilon')
 parser.add_argument('--iter', type=int, default=0,
                     help='update steps for the tested model')
+parser.add_argument('--seats', type=str, default='1,3',
+                    help='Comma-separated seat indices to serve via ZMQ on ports 6000+seat. उदाहरण: 0 or 1,3')
 
 class CPU_Unpickler(pickle.Unpickler):
     def find_class(self, module, name):
@@ -79,6 +88,14 @@ class Player():
         return indexs[action]
 
 
+def _run_one_player_forever(index: int, args):
+    try:
+        run_one_player(index, args)
+    except KeyboardInterrupt:
+        # Let the parent process coordinate shutdown.
+        return
+
+
 def run_one_player(index, args):
     player = Player(args)
 
@@ -89,36 +106,45 @@ def run_one_player(index, args):
 
     action_index = 0
     while True:
-        state = deserialize(socket.recv())
+        state = _loads(socket.recv())
         action_index = player.sample(state)
         # print(f'actor{index} do action number {action_index}')
-        socket.send(serialize(action_index).to_buffer())
+        socket.send(_dumps(action_index))
 
 
 def main():
     # 参数传递
     args, _ = parser.parse_known_args()
 
-    def exit_wrapper(index, *x, **kw):
-        """Exit all actors on KeyboardInterrupt (Ctrl-C)"""
-        try:
-            run_one_player(index, *x, **kw)
-        except KeyboardInterrupt:
-            if index == 0:
-                for _i, _p in enumerate(players):
-                    if _i != index:
-                        _p.terminate()
+    try:
+        seat_list = [int(s.strip()) for s in args.seats.split(',') if s.strip() != '']
+    except ValueError:
+        raise SystemExit(f"Invalid --seats '{args.seats}'. Expected comma-separated integers like '0' or '1,3'.")
+    if not seat_list:
+        raise SystemExit("--seats must specify at least one seat.")
 
     players = []
-    for i in [1, 3]:
+    for i in seat_list:
         # print(f'start{i}')
-        p = Process(target=exit_wrapper, args=(i, args))
+        p = Process(target=_run_one_player_forever, args=(i, args))
         p.start()
         time.sleep(0.5)
         players.append(p)
 
-    for player in players:
-        player.join()
+    try:
+        for player in players:
+            player.join()
+    except KeyboardInterrupt:
+        for p in players:
+            try:
+                p.terminate()
+            except Exception:
+                pass
+        for p in players:
+            try:
+                p.join(timeout=2)
+            except Exception:
+                pass
 
 
 if __name__ == '__main__':

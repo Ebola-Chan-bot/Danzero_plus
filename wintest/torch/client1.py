@@ -7,12 +7,20 @@ from random import randint
 
 import numpy as np
 import zmq
-from pyarrow import deserialize, serialize
+import pickle
 from util import card2array, card2num, combine_handcards
 from ws4py.client.threadedclient import WebSocketClient
 
 warnings.filterwarnings("ignore")
 os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+
+
+def _dumps(obj) -> bytes:
+    return pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
+
+
+def _loads(data: bytes):
+    return pickle.loads(data)
 parser = ArgumentParser()
 parser.add_argument('--ip', type=str, default='127.0.0.1',
                     help='IP address of learner server')
@@ -20,6 +28,8 @@ parser.add_argument('--action_port', type=int, default=6000,
                     help='Learner server port to send training data')
 parser.add_argument('--resfile', type=str, default='res',
                     help='Learner server port to send training data')
+parser.add_argument('--seat', type=int, default=1,
+                    help='Seat index (0..3). Connects to /game/client{seat} and ZMQ port (action_port+seat).')
 
 
 RANK = {
@@ -147,7 +157,7 @@ class ExampleClient(WebSocketClient):
         self.context = zmq.Context()
         self.context.linger = 0 
         self.socket = self.context.socket(zmq.REQ)
-        self.socket.connect(f'tcp://localhost:{6001}')
+        self.socket.connect(f'tcp://localhost:{self.args.action_port + self.args.seat}')
 
     def opened(self):
         pass
@@ -320,9 +330,9 @@ class ExampleClient(WebSocketClient):
 
                     # state = self.prepare(message)
                     # 传输给决策模块
-                    self.socket.send(serialize(state).to_buffer())
+                    self.socket.send(_dumps(state))
                     # 收到决策
-                    act_index = deserialize(self.socket.recv())
+                    act_index = _loads(self.socket.recv())
                     # 作出决策
                     # print('actionList', message['actionList'])
                     # act_index = 0
@@ -772,9 +782,9 @@ class ExampleClient(WebSocketClient):
 
 if __name__ == '__main__':
     args, _ = parser.parse_known_args()
-    args.client_index = 1
+    args.client_index = args.seat
     try:
-        ws = ExampleClient('ws://127.0.0.1:23456/game/client1', args)
+        ws = ExampleClient(f'ws://127.0.0.1:23456/game/client{args.seat}', args)
         ws.connect()
         ws.run_forever()
     except KeyboardInterrupt:
