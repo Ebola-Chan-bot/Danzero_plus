@@ -12,9 +12,9 @@ from typing import Dict, List, Optional, Tuple
 import websockets
 from websockets.server import ServerConnection
 
-# Reuse card universe used by torch client.
-# NOTE: `wintest/` is not a Python package in this repo; follow existing scripts
-# by importing `wintest/torch/util.py` via sys.path.
+# 复用 torch 客户端使用的牌面编码全集。
+# 注意：本仓库的 wintest/ 不是 Python 包；这里按已有脚本做法，
+# 通过 sys.path 引入 wintest/torch/util.py。
 _THIS_DIR = os.path.dirname(__file__)
 _TORCH_DIR = os.path.abspath(os.path.join(_THIS_DIR, "..", "torch"))
 if _TORCH_DIR not in sys.path:
@@ -39,7 +39,7 @@ def format_card_for_human(card: Card) -> str:
     return f"{suit_symbol.get(s, s)}{rank_display.get(r, r)}"
 
 def format_cards_for_human(cards: List[Card]) -> str:
-    # Compress duplicates: show each distinct card once with ×n.
+    # 压缩重复牌：每种牌只显示一次，并用 ×n 表示数量。
     if not cards:
         return ""
     cnt = Counter(cards)
@@ -90,10 +90,10 @@ class _PersistentHumanActionPicker:
         rank_desc = ["A", "K", "Q", "J", "T", "9", "8", "7", "6", "5", "4", "3", "2"]
         self.cur_rank = cur_rank
         self.rank_chars = [cur_rank] + [r for r in rank_desc if r != cur_rank]
-        # Suit order requirement: from bottom to top is ♦ ♣ ♥ ♠, so top->bottom is ♠ ♥ ♣ ♦.
-        self.suit_rows = ["S", "H", "C", "D"]  # top -> bottom
+        # 花色顺序要求：从下到上是 ♦ ♣ ♥ ♠，因此从上到下是 ♠ ♥ ♣ ♦。
+        self.suit_rows = ["S", "H", "C", "D"]  # 从上到下
 
-        self._mode: str = "idle"  # idle | ai_hand | human
+        self._mode: str = "idle"  # 模式：idle | ai_hand | human（空闲 | 选 AI 手牌 | 人类出牌）
 
         self.seat = 1
         self.remaining = 27
@@ -125,8 +125,7 @@ class _PersistentHumanActionPicker:
         self.context_var = tk.StringVar(value="")
         tk.Label(root, textvariable=self.context_var).pack(padx=8, pady=(0, 6), anchor="w")
 
-        # Preview area: use a fixed-size container so clearing preview won't shrink and
-        # pull the card-button grid upward.
+        # 预览区：使用固定尺寸容器，清空预览时不缩回，避免把下面的牌按钮网格往上顶。
         preview_container = tk.Frame(root)
         preview_container.pack(padx=8, pady=(0, 8), fill="x", anchor="w")
         try:
@@ -163,8 +162,7 @@ class _PersistentHumanActionPicker:
             lbl.grid(row=joker_row, column=col, padx=1, pady=1)
             self.preview_cells[code] = lbl
 
-        # After layout is realized, lock preview container to its initial requested size.
-        # Later we will only increase this size (never shrink).
+        # 布局生成后，将预览容器锁定为初始请求尺寸；后续只允许增大（不允许变小）。
         try:
             root.update_idletasks()
             self._max_preview_w = max(1, int(self.preview_frame.winfo_reqwidth()))
@@ -173,7 +171,7 @@ class _PersistentHumanActionPicker:
         except Exception:
             pass
 
-        # Card buttons
+        # 牌按钮区
         frame = tk.Frame(root)
         frame.pack(padx=8, pady=8, fill="both", expand=True)
         self.buttons: Dict[str, tk.Button] = {}
@@ -209,7 +207,7 @@ class _PersistentHumanActionPicker:
             btn.grid(row=joker_row, column=col, padx=2, pady=2)
             self.buttons[code] = btn
 
-        # Action bar (fixed at bottom so it won't move)
+        # 操作栏（固定在底部，避免上下跳动）
         action_bar = tk.Frame(root)
         action_bar.pack(side="bottom", padx=8, pady=(0, 8), fill="x")
 
@@ -223,7 +221,7 @@ class _PersistentHumanActionPicker:
         self._done_var = tk.IntVar(value=0)
         root.protocol("WM_DELETE_WINDOW", self._on_close)
 
-        # Start visible and ready.
+        # 默认显示并就绪。
         self._refresh_ui()
 
     def _card_color(self, card: str) -> str:
@@ -250,7 +248,7 @@ class _PersistentHumanActionPicker:
         self.selected_count.clear()
 
     def _refresh_ui(self):
-        # Title + context
+        # 标题与上下文
         try:
             if self._mode == "ai_hand":
                 self.root.title("选择 AI(seat0) 起手牌（点满 27 张后确认）")
@@ -274,7 +272,7 @@ class _PersistentHumanActionPicker:
             self.info_var.set("")
             self.context_var.set("等待手动出牌…")
 
-        # Preview cells
+        # 预览格子
         sel_cnt = Counter(self.selected)
         for code, lbl in self.preview_cells.items():
             cnt = int(sel_cnt.get(code, 0))
@@ -284,7 +282,7 @@ class _PersistentHumanActionPicker:
                 tok = format_card_for_human(code)
                 lbl.configure(text="\n".join([tok] * cnt))
 
-        # Buttons state & remaining
+        # 按钮状态与剩余数量
         for c, btn in self.buttons.items():
             avail = self._available_for(c)
             cnt = int(self.selected_count.get(c, 0))
@@ -300,7 +298,7 @@ class _PersistentHumanActionPicker:
             else:
                 btn.configure(state="normal")
 
-        # Action buttons per mode
+        # 不同模式下的操作按钮
         if self._mode == "ai_hand":
             self.pass_btn.configure(state="disabled")
             self.undo_btn.configure(state="normal")
@@ -317,12 +315,12 @@ class _PersistentHumanActionPicker:
             self.undo_btn.configure(state="disabled")
             self.confirm_btn.configure(state="disabled")
 
-        # Keep window from shrinking once expanded.
+        # 窗口一旦变大后不再缩小。
         try:
             self.root.update_idletasks()
 
-            # Lock preview container size to the maximum requested size, so clearing selection
-            # won't make the preview area shrink and move the grid below.
+            # 将预览容器尺寸锁定为“历史最大请求尺寸”，这样清空选择时预览区不会缩小，
+            # 也就不会带动下面的网格布局发生位移。
             try:
                 pw = int(self.preview_frame.winfo_reqwidth())
                 ph = int(self.preview_frame.winfo_reqheight())
@@ -418,13 +416,13 @@ class _PersistentHumanActionPicker:
         self._done_var.set(1)
 
     def _on_close(self):
-        # User closed the window:
-        # - AI-hand mode: treat as random (empty string), but keep the window instance.
-        # - Human mode: fall back to terminal for THIS turn; next time we will show the window again.
+        # 用户关闭窗口：
+        # - AI 手牌模式：视为随机（返回空字符串），但保留窗口实例供后续复用。
+        # - 人类出牌模式：本回合回退到终端输入；下次需要输入时再把窗口显示出来。
         self._closed_for_turn = True
         if self._mode == "ai_hand":
             self._result_ai_hand = ""
-        # Hide instead of destroying so it can be reopened later.
+        # 只隐藏不销毁，便于后续再次打开。
         try:
             self.root.withdraw()
         except Exception:
@@ -459,7 +457,7 @@ class _PersistentHumanActionPicker:
         self._clear_selection()
         self._refresh_ui()
 
-        # Wait for user
+        # 等待用户操作
         self._done_var.set(0)
         try:
             self.root.deiconify()
@@ -470,7 +468,7 @@ class _PersistentHumanActionPicker:
         self.root.wait_variable(self._done_var)
 
         if self._closed_for_turn:
-            # Fall back to terminal for this turn.
+            # 本回合回退到终端输入。
             self._idle()
             raise _GuiFallbackToTerminalThisTurn()
 
@@ -483,7 +481,7 @@ class _PersistentHumanActionPicker:
         return act
 
     def pick_ai_hand(self) -> str:
-        # AI hand selection: no played/AI constraints, only 2 decks limit.
+        # AI 手牌选择：不受已出牌/AI 手牌冲突约束，仅检查“两副牌库存”上限。
         self._mode = "ai_hand"
         self.seat = 0
         self.remaining = 27
@@ -507,7 +505,7 @@ class _PersistentHumanActionPicker:
             pass
         self.root.wait_variable(self._done_var)
 
-        # If user closed the window: random
+        # 如果用户关闭窗口：视为随机
         if self._closed_for_turn:
             self._idle()
             return ""
@@ -531,7 +529,7 @@ def _pick_human_action_gui(
 ) -> Action:
     global _HUMAN_PICKER
 
-    # Create once, keep the window for the whole session.
+    # 只创建一次，整个会话复用同一个窗口。
     if _HUMAN_PICKER is None:
         _HUMAN_PICKER = _PersistentHumanActionPicker(cur_rank=cur_rank)
 
@@ -545,9 +543,9 @@ def _pick_human_action_gui(
 
 
 def _parse_human_token_to_card(token: str) -> Optional[Card]:
-    """Parse a single human token to internal Card code (e.g. ♥10 -> HT, ♣3 -> C3).
+    """将人类输入的单个牌面 token 解析为内部 Card 编码（如：♥10 -> HT，♣3 -> C3）。
 
-    Note: Joker is handled separately because plain 'JOKER' is ambiguous (HR/SB).
+    注意：Joker 需要单独处理，因为纯 'JOKER' 是不明确的（可能是 HR/SB）。
     """
 
     t = token.strip()
@@ -609,7 +607,7 @@ def rank_value(rank_char: str, cur_rank: str) -> int:
 
 
 def make_double_deck() -> List[Card]:
-    # Two decks, duplicates allowed. Strings represent card faces; duplicates are represented by repeated strings.
+    # 两副牌：允许重复。用字符串表示牌面；重复牌用同一字符串重复出现来表示。
     cards = list(CardToNum.keys())
     return cards + cards
 
@@ -617,7 +615,7 @@ def make_double_deck() -> List[Card]:
 def parse_cards_csv(s: str) -> List[Card]:
     if not s:
         return []
-    # Accept commas or spaces.
+    # 允许用逗号或空格分隔。
     raw = s.replace(",", " ").split()
     return [x.strip() for x in raw if x.strip()]
 
@@ -637,20 +635,20 @@ def remove_multiset(deck: List[Card], cards: List[Card]) -> None:
 
 
 def action_key_from_cards(cards: List[Card], cur_rank: str) -> Tuple[int, int]:
-    # Returns (primary_value, length) used for rough comparisons.
+    # 返回 (主比较值, 长度)，用于粗略比较。
     if not cards:
         return (0, 0)
     ranks = [c[-1] for c in cards]
-    # For same-rank patterns, primary is that rank value.
+    # 同点数牌型：主比较值取该点数的权值。
     if len(set(ranks)) == 1:
         return (rank_value(ranks[0], cur_rank), len(cards))
-    # For sequences (straight / threepair / twotrips), use max rank in A-high space.
+    # 连续牌型（顺子/三连对/钢板）：主比较值取（按 A 高）最大点数的权值。
     values = sorted(rank_value(r, cur_rank) for r in set(ranks))
     return (max(values), len(cards))
 
 
 def classify_action(cards: List[Card], cur_rank: str) -> Action:
-    # Returns [type, key, cards]
+    # 返回 [type, key, cards]
     if not cards:
         return ["PASS", "PASS", []]
 
@@ -659,7 +657,7 @@ def classify_action(cards: List[Card], cur_rank: str) -> Action:
     uniq = len(counts)
     n = len(cards)
 
-    # Single/Pair/Trips/Bomb (same rank)
+    # 单张/对子/三张/炸弹（同点数）
     if uniq == 1:
         r = ranks[0]
         if n == 1:
@@ -671,28 +669,28 @@ def classify_action(cards: List[Card], cur_rank: str) -> Action:
         if n >= 4:
             return ["Bomb", r, cards]
 
-    # Full house (3+2)
+    # 三带二（3+2）
     if n == 5 and sorted(counts.values()) == [2, 3]:
         trip_rank = [r for r, c in counts.items() if c == 3][0]
         return ["ThreeWithTwo", trip_rank, cards]
 
-    # ThreePair (3 consecutive pairs)
+    # 三连对（3 个连续对子）
     if n == 6 and sorted(counts.values()) == [2, 2, 2]:
-        # Use min rank as key for display; comparisons will use computed key.
+        # 显示用最小点数作为 key；比较时会用计算得到的比较值。
         ordered = sorted(counts.keys(), key=lambda r: rank_value(r, cur_rank))
-        # Check consecutive in rank order
+        # 按点数检查是否连续
         vals = [rank_value(r, cur_rank) for r in ordered]
         if vals[0] + 1 == vals[1] and vals[1] + 1 == vals[2]:
             return ["ThreePair", ordered[0], cards]
 
-    # TwoTrips (2 consecutive trips)
+    # 钢板（2 个连续三张）
     if n == 6 and sorted(counts.values()) == [3, 3]:
         ordered = sorted(counts.keys(), key=lambda r: rank_value(r, cur_rank))
         vals = [rank_value(r, cur_rank) for r in ordered]
         if vals[0] + 1 == vals[1]:
             return ["TwoTrips", ordered[0], cards]
 
-    # Straight length 5 (allow A2345)
+    # 顺子（长度 5，允许 A2345）
     if n == 5 and all(c == 1 for c in counts.values()):
         ordered = sorted(counts.keys(), key=lambda r: BASE_RANK_VALUE.get(r, 99))
         vals = [BASE_RANK_VALUE[r] for r in ordered]
@@ -701,7 +699,7 @@ def classify_action(cards: List[Card], cur_rank: str) -> Action:
             return ["Straight", "5", cards]
         vals_sorted = sorted(vals)
         if vals_sorted[0] + 1 == vals_sorted[1] and vals_sorted[1] + 1 == vals_sorted[2] and vals_sorted[2] + 1 == vals_sorted[3] and vals_sorted[3] + 1 == vals_sorted[4]:
-            # key as highest rank char (best-effort)
+            # key 取最高点数字符（尽力而为）
             high_val = vals_sorted[-1]
             inv = {v: k for k, v in BASE_RANK_VALUE.items() if k in list("23456789TJQKA")}
             key = inv.get(high_val, ordered[-1])
@@ -720,7 +718,7 @@ def beats(action: Action, greater_action: Optional[Action], cur_rank: str) -> bo
     if greater_action[0] == "PASS":
         return action[0] != "PASS"
 
-    # Bomb beats everything non-bomb.
+    # 炸弹压过所有非炸弹。
     if action[0] == "Bomb" and greater_action[0] != "Bomb":
         return True
 
@@ -730,7 +728,7 @@ def beats(action: Action, greater_action: Optional[Action], cur_rank: str) -> bo
     a_key, a_len = action_key_from_cards(action[2], cur_rank)
     g_key, g_len = action_key_from_cards(greater_action[2], cur_rank)
 
-    # Must match length for same type.
+    # 同类型必须长度一致。
     if a_len != g_len:
         return False
 
@@ -738,7 +736,7 @@ def beats(action: Action, greater_action: Optional[Action], cur_rank: str) -> bo
 
 
 def generate_actions_from_hand(hand: List[Card], cur_rank: str) -> List[Action]:
-    # This follows the torch client's representation: [type, key, cards]
+    # 遵循 torch 客户端的动作表示：[type, key, cards]
     card_value_s2v = dict(BASE_RANK_VALUE)
     card_value_s2v[cur_rank] = 15
 
@@ -746,7 +744,7 @@ def generate_actions_from_hand(hand: List[Card], cur_rank: str) -> List[Action]:
 
     actions: List[Action] = []
 
-    # Singles, pairs, trips
+    # 单张、对子、三张
     for c in sorted_cards.get("Single", []):
         actions.append(["Single", c[-1], [c]])
     for pair in sorted_cards.get("Pair", []):
@@ -754,17 +752,17 @@ def generate_actions_from_hand(hand: List[Card], cur_rank: str) -> List[Action]:
     for trips in sorted_cards.get("Trips", []):
         actions.append(["Trips", trips[0][-1], trips])
 
-    # Straight / sequences already produced in util.combine_handcards
+    # 顺子/连续结构已由 util.combine_handcards 生成
     for st in sorted_cards.get("Straight", []) or []:
         actions.append(["Straight", st[0][-1], st])
 
-    # ThreeWithTwo
+    # 三带二
     if sorted_cards.get("Pair") and sorted_cards.get("Trips"):
         for t in sorted_cards["Trips"]:
             for p in sorted_cards["Pair"]:
                 actions.append(["ThreeWithTwo", t[0][-1], t + p])
 
-    # ThreePair
+    # 三连对
     pair_actions = []
     for pair in sorted_cards.get("Pair", []) or []:
         pair_actions.append(["Pair", pair[0][-1], pair])
@@ -778,7 +776,7 @@ def generate_actions_from_hand(hand: List[Card], cur_rank: str) -> List[Action]:
             cards = pair_actions[i][2] + pair_actions[i + 1][2] + pair_actions[i + 2][2]
             actions.append(["ThreePair", pair_actions[i][1], cards])
 
-    # TwoTrips
+    # 钢板
     trips_actions = []
     for t in sorted_cards.get("Trips", []) or []:
         trips_actions.append(["Trips", t[0][-1], t])
@@ -790,11 +788,11 @@ def generate_actions_from_hand(hand: List[Card], cur_rank: str) -> List[Action]:
             cards = trips_actions[i][2] + trips_actions[i + 1][2]
             actions.append(["TwoTrips", trips_actions[i][1], cards])
 
-    # Bombs (4+ of a rank)
+    # 炸弹（同点数 4 张及以上）
     for bomb_cards in sorted_cards.get("Bomb", []) or []:
         actions.append(["Bomb", bomb_cards[0][-1], bomb_cards])
 
-    # Deterministic-ish ordering
+    # 尽量稳定（可复现）的排序
     def sort_key(a: Action) -> Tuple[int, int, str]:
         t = a[0]
         type_order = {
@@ -834,13 +832,13 @@ class MiniDanServer:
         self.cur_rank = cur_rank
         self.self_rank = self_rank
         self.oppo_rank = oppo_rank
-        self.ai_hand = ai_hand[:]  # seat0
+        self.ai_hand = ai_hand[:]  # 座位 seat0
         self.max_steps = max_steps
 
         self.seat_conns: Dict[int, SeatConn] = {}
 
-        # Track what has been played (two decks) and remaining hand sizes for manual seats.
-        self.played_cards = Counter()  # Card -> count already played
+        # 记录已出过的牌（两副牌库存）以及人类座位剩余手牌数量。
+        self.played_cards = Counter()  # Card -> 已出过数量
         self.human_remaining = {1: 27, 2: 27, 3: 27}
 
         self.current_pos = int(start_pos)
@@ -872,9 +870,9 @@ class MiniDanServer:
                 "type": "notify",
                 "stage": "beginning",
                 "myPos": seat,
-                # For ai2 compatibility.
+                # 兼容 ai2 客户端。
                 "handCards": self.ai_hand[:] if seat == 0 else [],
-                # Keep ranks as strings to satisfy torch client's prepare().
+                # 保持为字符串，满足 torch 客户端 prepare() 的要求。
                 "curRank": self.cur_rank,
                 "selfRank": self.self_rank,
                 "oppoRank": self.oppo_rank,
@@ -882,7 +880,7 @@ class MiniDanServer:
         )
 
     def prompt_human_action(self, seat: int) -> Action:
-        # Prefer GUI selection.
+        # 优先使用 GUI 选牌。
         try:
             import tkinter  # noqa: F401
 
@@ -894,17 +892,17 @@ class MiniDanServer:
                 played_cards=self.played_cards,
                 greater_action=self.greater_action,
             )
-            # Echo what was chosen in the GUI to terminal.
+            # 将 GUI 中的选择结果回显到终端。
             if act[0] == "PASS":
                 print(f"Seat{seat}（窗口）选择：过")
             else:
                 print(f"Seat{seat}（窗口）选择：{format_action_for_human(act)}")
             return act
         except _GuiFallbackToTerminalThisTurn:
-            # User closed the window this turn; fall back to terminal input.
+            # 本回合用户关闭窗口，回退到终端输入。
             pass
         except Exception as e:
-            # Fall back to terminal input if GUI isn't available, but show one-line reason once.
+            # GUI 不可用则回退到终端输入，但只打印一次失败原因（避免刷屏）。
             if not getattr(self, "_gui_prompt_failed_once", False):
                 self._gui_prompt_failed_once = True
                 print(f"GUI 选牌窗口不可用，已回退终端输入：{type(e).__name__}: {e}")
@@ -928,14 +926,14 @@ class MiniDanServer:
 
             raw_tokens = s.replace(",", " ").split()
 
-            # Parse human-friendly tokens into internal codes.
+            # 将人类友好输入解析为内部编码。
             ai_counter = Counter(self.ai_hand)
             parsed_cards: List[Card] = []
             parse_error = None
             for tok in raw_tokens:
                 up = tok.strip().upper()
                 if up == "JOKER":
-                    # Choose an available joker deterministically: HR first, then SB.
+                    # 确定性地选择一个可用的王：优先 HR，其次 SB。
                     for cand in ("HR", "SB"):
                         available = 2 - self.played_cards.get(cand, 0) - ai_counter.get(cand, 0)
                         if available > 0:
@@ -962,9 +960,9 @@ class MiniDanServer:
                 print(f"出牌张数超过 Seat{seat} 剩余手牌：剩余={self.human_remaining.get(seat, 27)} 张。")
                 continue
 
-            # Constraints requested:
-            # - Can't use cards currently in AI hand (seat0)
-            # - Can't use cards that have already been played, considering 2-deck supply
+            # 约束：
+            # - 不能使用当前在 AI 手牌（seat0）中的牌
+            # - 不能使用已经出过的牌（考虑两副牌库存）
             need = Counter(cards)
             violated = []
             for c, n in need.items():
@@ -991,11 +989,11 @@ class MiniDanServer:
             return act
 
     async def run_game_loop(self):
-        # For now: only seat0 is required to be connected.
+        # 当前实现：只要求 seat0 连接即可开局。
         if 0 not in self.seat_conns:
             raise RuntimeError("需要 seat0 连接到 /game/client0")
 
-        # Send beginning once connected.
+        # 连接后发送 beginning。
         await self.send_beginning(0)
 
         steps = 0
@@ -1007,7 +1005,7 @@ class MiniDanServer:
             greater_action_payload = self.greater_action if self.greater_action is not None else ["PASS", "PASS", []]
 
             if self.current_pos == 0:
-                # AI's turn
+                # AI 回合
                 all_actions = generate_actions_from_hand(self.ai_hand, self.cur_rank)
 
                 if self.greater_action is None:
@@ -1017,7 +1015,7 @@ class MiniDanServer:
                     action_list = [["PASS", "PASS", []]] + filtered
 
                 if not action_list:
-                    # Should never happen (at least could pass when not leading), but keep safe.
+                    # 理论上不应发生（非先手至少能 PASS），这里兜底保证安全。
                     action_list = [["PASS", "PASS", []]]
 
                 msg = {
@@ -1029,7 +1027,7 @@ class MiniDanServer:
                     "curRank": self.cur_rank,
                     "selfRank": self.self_rank,
                     "oppoRank": self.oppo_rank,
-                    # For ai2 compatibility.
+                    # 兼容 ai2 客户端。
                     "curPos": self.current_pos,
                     "curAction": None,
                     "greaterPos": greater_pos_payload,
@@ -1043,18 +1041,18 @@ class MiniDanServer:
                     act_index = 0
                 act = action_list[act_index]
 
-                # Enforce AI hand (remove played cards)
+                # 扣除 AI 手牌（移除已出的牌）
                 if act[0] != "PASS":
                     for c in act[2]:
                         try:
                             self.ai_hand.remove(c)
                         except ValueError:
-                            # In case of mismatch, ignore; this is an experiment server.
+                            # 如有不一致则忽略；这里是实验服。
                             pass
                     self.played_cards.update(act[2])
 
             else:
-                # Human turn in server console
+                # 人类回合（服务器控制台输入）
                 try:
                     act = self.prompt_human_action(self.current_pos)
                 except (EOFError, KeyboardInterrupt):
@@ -1067,7 +1065,7 @@ class MiniDanServer:
                     )
                     self.played_cards.update(act[2])
 
-            # Compute new trick state (for ai2: notify payload expects greaterPos/greaterAction)
+            # 计算本轮新状态（ai2 的 notify 需要 greaterPos/greaterAction）
             if act[0] == "PASS":
                 new_greater_action = self.greater_action
                 new_greater_pos = self.greater_pos
@@ -1077,7 +1075,7 @@ class MiniDanServer:
                 new_greater_pos = self.current_pos
                 new_passes = 0
 
-            # Broadcast notify(play)
+            # 广播 notify(play)
             await self.broadcast(
                 {
                     "type": "notify",
@@ -1089,12 +1087,12 @@ class MiniDanServer:
                 }
             )
 
-            # Commit trick state
+            # 提交本轮状态
             self.greater_action = new_greater_action
             self.greater_pos = new_greater_pos
             self.passes_since_play = new_passes
 
-            # Trick ends after 3 passes since last play
+            # 自上一次有人出牌后，连续 3 个 PASS 则该墩结束
             if self.greater_action is not None and self.passes_since_play >= 3:
                 self.current_pos = int(self.greater_pos)
                 self.greater_action = None
@@ -1113,8 +1111,8 @@ class MiniDanServer:
 
 
 async def handler(ws: ServerConnection, server: MiniDanServer):
-    # Expect /game/client{seat}
-    # websockets 15 passes only the connection; path is available via ws.request.path.
+    # 期望路径格式：/game/client{seat}
+    # websockets v15 只传入连接对象；路径可通过 ws.request.path 获取。
     req = getattr(ws, "request", None)
     path = getattr(req, "path", None) or getattr(ws, "path", None) or ""
     seat = None
@@ -1129,7 +1127,7 @@ async def handler(ws: ServerConnection, server: MiniDanServer):
 
     await server.register(seat, ws)
     try:
-        # Keep connection alive; the game loop drives messages.
+        # 保持连接存活；由主循环驱动消息收发。
         await ws.wait_closed()
     finally:
         server.seat_conns.pop(seat, None)
@@ -1179,13 +1177,13 @@ async def main_async(args):
                 print(f"AI seat0 hand ({len(ai_hand)}): {format_cards_for_human(ai_hand)}")
 
                 if getattr(args, "spawn_ai", True):
-                    # Prefer torch AI if model files exist; otherwise fallback to wintest/ai2.
+                    # 优先使用 torch AI；若缺少模型文件则回退到 wintest/ai2。
                     torch_models_dir = os.path.join(torch_dir, "models")
                     torch_models = glob.glob(os.path.join(torch_models_dir, "ppo*.pth")) if os.path.isdir(torch_models_dir) else []
 
                     if torch_models:
-                        # Start ZMQ actor and WS AI client in the SAME terminal.
-                        # actor.py loads model files via relative paths, so set cwd=torch_dir.
+                        # 在同一个终端启动 ZMQ actor 与 WS AI client。
+                        # actor.py 通过相对路径加载模型文件，所以 cwd 需要设为 torch_dir。
                         child_procs.append(
                             subprocess.Popen(
                                 [sys.executable, os.path.join(torch_dir, "actor.py"), "--seats", "0"],
@@ -1209,12 +1207,12 @@ async def main_async(args):
                             )
                         )
 
-                # Run game loop; it will block on seat0 connection and console input for humans.
+                # 运行主循环：会阻塞等待 seat0 连接，以及等待人类的控制台输入。
                 while 0 not in server.seat_conns:
                     await asyncio.sleep(0.1)
                 await server.run_game_loop()
         except asyncio.CancelledError:
-            # Ctrl+C during asyncio.run() cancels pending awaits; exit quietly.
+            # asyncio.run() 期间 Ctrl+C 会取消挂起的 await；这里安静退出。
             pass
     finally:
         for p in child_procs:
@@ -1229,13 +1227,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=23456)
 
-    # Ranks are kept as strings for torch client compatibility.
-    # According to UX requirement, curRank and AI hand are entered interactively at startup,
-    # so we do not require command-line flags for them.
+    # 级牌/段位保持为字符串，兼容 torch 客户端。
+    # 根据 UX 约定，curRank 与 AI 手牌在启动时交互输入，因此不强制要求命令行参数。
 
     p.add_argument("--max-steps", type=int, default=50, help="最多推进多少个出牌动作（避免你不小心打完整局）")
 
-    # Default to single-terminal mode.
+    # 默认单终端模式。
     p.add_argument(
         "--no-spawn-ai",
         action="store_true",
@@ -1271,7 +1268,7 @@ def _prompt_start_pos(default: int = 0) -> int:
 
 
 def _prompt_ai_hand(cur_rank: str) -> str:
-    # Prefer GUI selection; fall back to text input.
+    # 优先 GUI 选择；GUI 不可用则回退文本输入。
     global _HUMAN_PICKER
     try:
         import tkinter  # noqa: F401
@@ -1288,7 +1285,7 @@ def _prompt_ai_hand(cur_rank: str) -> str:
 def main():
     try:
         args = build_arg_parser().parse_args()
-        # Interactive inputs
+        # 交互输入
         args.cur_rank = _prompt_cur_rank("2")
         args.start_pos = _prompt_start_pos(0)
         args.self_rank = "2"

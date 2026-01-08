@@ -1,12 +1,12 @@
-"""Workspace-root entrypoint for the mini danserver.
+"""工作区根目录入口：mini danserver 启动封装。
 
-This repo's original implementation lives at:
+本仓库的主要实现位于：
   wintest/mini_server/mini_danserver.py
 
-Keeping a thin wrapper at workspace root makes it easier to run:
+把一个薄封装放在工作区根目录，方便直接运行：
   python mini_danserver.py
 
-without turning `wintest/` into a Python package.
+同时避免把 wintest/ 变成 Python 包。
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ def main() -> None:
     if not os.path.exists(target):
         raise SystemExit(f"Cannot find mini_danserver implementation at: {target}")
 
-    # Forward CLI args to the underlying script.
+    # 将命令行参数透传给底层脚本。
     sys.argv[0] = target
     try:
       runpy.run_path(target, run_name="__main__")
