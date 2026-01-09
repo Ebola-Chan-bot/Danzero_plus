@@ -28,6 +28,14 @@ class Action(object):
         self.act_range = -1
 
     def GetIndexFromBack(self, msg, retValue): #"actionList": [['back', 'back', ['S2']], ['back', 'back', ['H2']]
+        # Prefer explicit index when available (server list may contain duplicates).
+        try:
+            if isinstance(retValue, dict) and "actIndex" in retValue:
+                idx = int(retValue["actIndex"])
+                if 0 <= idx < len(msg.get("actionList", [])):
+                    return idx
+        except Exception:
+            pass
         retIndex = 0
         retAction = retValue['action']
         for action in msg["actionList"]:
@@ -36,6 +44,14 @@ class Action(object):
         return retIndex
 
     def GetIndexFromPlay(self, msg, retValue):
+        # Prefer explicit index when available (参谋多解时同牌面可能出现多个合法动作)。
+        try:
+            if isinstance(retValue, dict) and "actIndex" in retValue:
+                idx = int(retValue["actIndex"])
+                if 0 <= idx < len(msg.get("actionList", [])):
+                    return idx
+        except Exception:
+            pass
         #print("actionlist:",msg["actionList"])
 
         sortedAction = retValue["action"]

@@ -108,9 +108,25 @@ class MyClient(WebSocketClient):
             # 在动作序列中记录动作
             elif message['stage'] == 'play':
                 just_play = message['curPos']
-                action = card2num(message['curAction'][2])
+                cur_action = message['curAction']
+                # 真实出牌：用于统计牌库/对手剩余牌（必须用真实花色）
+                real_action = card2num(cur_action[2])
+
+                # 模型动作：若服务器提供 virtual_ranks（参谋消歧义），则用其构造“虚拟出牌”
+                model_cards = cur_action[2]
+                try:
+                    if isinstance(cur_action, list) and len(cur_action) >= 4 and isinstance(cur_action[3], dict):
+                        vr = cur_action[3].get('virtual_ranks')
+                        if isinstance(vr, list) and len(vr) == len(model_cards):
+                            tmp = []
+                            for c, r in zip(model_cards, vr):
+                                tmp.append(f"S{r}" if isinstance(c, str) and len(c) >= 2 and r != c[-1] else c)
+                            model_cards = tmp
+                except Exception:
+                    pass
+                action = card2num(model_cards)
                 if message['curPos'] != self.mypos:
-                    for ele in action:
+                    for ele in real_action:
                         self.other_left_hands[ele] -= 1
                 if len(self.over) == 0:    # 如果没人出完牌
                     self.action_order.append(just_play)
@@ -346,7 +362,20 @@ class MyClient(WebSocketClient):
 
     def prepare(self, message):
         num_legal_actions = message['indexRange'] + 1
-        legal_actions = [card2num(i[2]) for i in message['actionList']]
+        legal_actions = []
+        for act in message['actionList']:
+            cards = act[2]
+            try:
+                if isinstance(act, list) and len(act) >= 4 and isinstance(act[3], dict):
+                    vr = act[3].get('virtual_ranks')
+                    if isinstance(vr, list) and len(vr) == len(cards):
+                        tmp = []
+                        for c, r in zip(cards, vr):
+                            tmp.append(f"S{r}" if isinstance(c, str) and len(c) >= 2 and r != c[-1] else c)
+                        cards = tmp
+            except Exception:
+                pass
+            legal_actions.append(card2num(cards))
         my_handcards = card2array(card2num(message['handCards']))   # 自己的手牌,54维
         # print('my_handcards', my_handcards)
         my_handcards_batch = np.repeat(my_handcards[np.newaxis, :],

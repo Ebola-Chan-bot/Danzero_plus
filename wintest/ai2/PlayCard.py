@@ -9,6 +9,105 @@ from strategy import Strategy
 
 class PlayCard():
 
+    def _eval_cards_from_full_action(self, act):
+        """Return cards list for evaluation (参谋按 virtual_ranks 变成虚拟点数牌).
+
+        - 真实扣牌/剩余手牌计算必须使用 act[2] 原始牌面。
+        - 评估/算分可使用虚拟点数（不依赖花色），以便理解参谋补牌的消歧义信息。
+        """
+        try:
+            cards = act[2]
+        except Exception:
+            return []
+        if not isinstance(cards, list):
+            return cards
+
+        try:
+            if isinstance(act, list) and len(act) >= 4 and isinstance(act[3], dict):
+                vr = act[3].get("virtual_ranks")
+                if isinstance(vr, list) and len(vr) == len(cards):
+                    out = []
+                    for c, r in zip(cards, vr):
+                        # 只有参谋才会出现 r != c[-1]；用统一黑桃承载点数即可。
+                        if isinstance(c, str) and len(c) >= 2 and isinstance(r, str) and r != c[-1]:
+                            out.append("S" + r)
+                        else:
+                            out.append(c)
+                    return out
+        except Exception:
+            pass
+        return cards
+
+    def _best_from_full_action_list(self, handCards, curRank, fullActionList, mode="free", formerAction=None):
+        """Pick the best action directly from server-provided actionList.
+
+        This is necessary for 参谋多解：同一组真实牌面可能对应多种合法补法，
+        仅靠 (type, rank, cards) 可能无法稳定消歧义。
+        """
+        # fullActionList is a list like: [[type, rank, cards, (optional detail)], ...]
+        if not isinstance(fullActionList, list) or len(fullActionList) == 0:
+            return None
+
+        # Prefer non-PASS when leading.
+        allow_pass = True
+        if formerAction is None:
+            allow_pass = False
+
+        best = None
+        best_idx = 0
+        best_value = -10**9
+
+        for idx, act in enumerate(fullActionList):
+            try:
+                typ = act[0]
+                rank = act[1]
+                cards = act[2]
+            except Exception:
+                continue
+
+            if typ == 'PASS' and not allow_pass:
+                continue
+
+            # 扣牌必须用真实牌面
+            restCards = CreateActionList().GetRestCards(cards if typ != 'PASS' else [], handCards)
+            restValue, restActions = CountValue().HandCardsValue(restCards, 0, curRank)
+            # 算分可用虚拟点数（参谋消歧义）
+            eval_cards = self._eval_cards_from_full_action(act) if typ != 'PASS' else []
+            thisHandValue = CountValue().ActionValue(eval_cards, typ, rank, curRank)
+
+            if mode == "free":
+                thisHandValue += Strategy.freeActionRV.get(typ, 0)
+                if (typ, rank) in Strategy.freeActionRV:
+                    thisHandValue += Strategy.freeActionRV[(typ, rank)]
+            else:
+                thisHandValue += Strategy.restrictedActionRV.get(typ, 0)
+                if (typ, rank) in Strategy.restrictedActionRV:
+                    thisHandValue += Strategy.restrictedActionRV[(typ, rank)]
+
+            if thisHandValue < 0:
+                thisHandValue = 0
+            total = thisHandValue + restValue
+
+            tie_smaller = False
+            if best is not None and total == best_value:
+                try:
+                    card_cmp = rank
+                    if typ in ('Bomb', 'StraightFlush'):
+                        card_cmp = len(cards)
+                    best_card_cmp = best["rank"]
+                    if best["type"] in ('Bomb', 'StraightFlush'):
+                        best_card_cmp = len(best["action"]) if isinstance(best.get("action"), list) else best["rank"]
+                    tie_smaller = CompareRank().Smaller(typ, rank, card_cmp, best, curRank)
+                except Exception:
+                    tie_smaller = False
+
+            if best is None or total > best_value or (total == best_value and tie_smaller):
+                best_value = total
+                best_idx = idx
+                best = {"action": cards if typ != 'PASS' else 'PASS', "type": typ, "rank": rank, "actIndex": idx}
+
+        return best
+
     def actBack(self, handCards, curRank):
         bestPlay = []
         maxValue = -100
@@ -39,6 +138,19 @@ class PlayCard():
         return additionalActionList
 
     def FreePlay(self, handCards, curRank, fullActionList = None):
+        # If server provided a concrete actionList, pick directly from it (covers 参谋补牌的所有合法动作)。
+        if isinstance(fullActionList, list) and len(fullActionList) > 0 and isinstance(fullActionList[0], list):
+            try:
+                handValue, handActions = CountValue().HandCardsValue(handCards, 0, curRank)
+                Strategy.SetRole(handValue, handActions, curRank)
+                Strategy.makeReviseValues()
+            except Exception:
+                # Strategy 状态可能尚未完全初始化；不影响直接从 actionList 选动作。
+                pass
+            pick = self._best_from_full_action_list(handCards, curRank, fullActionList, mode="free", formerAction=None)
+            if pick is not None:
+                return pick
+
         handValue, handActions = CountValue().HandCardsValue(handCards, 0, curRank)
         #print(handActions)
         #Strategy.SetBeginning(0)
@@ -99,7 +211,7 @@ class PlayCard():
                 restCards = CreateActionList().GetRestCards(action[2], handCards)
                 restValue, restActions = CountValue().HandCardsValue(restCards, 0, curRank)
                 restValue += Strategy.handRV[type]
-                thisHandValue = CountValue().ActionValue(action[2], type, rank, curRank)
+                thisHandValue = CountValue().ActionValue(self._eval_cards_from_full_action(action), type, rank, curRank)
                 thisHandValue += Strategy.freeActionRV[type]
                 if (type, rank) in Strategy.freeActionRV.keys():
                     thisHandValue += Strategy.freeActionRV[(type, rank)]
@@ -115,6 +227,18 @@ class PlayCard():
         return bestPlay
 
     def RestrictedPlay(self, handCards, formerAction, curRank, fullActionList = None):
+        # If server provided a concrete actionList (already legal & includes 参谋补牌 variants), pick directly.
+        if isinstance(fullActionList, list) and len(fullActionList) > 0 and isinstance(fullActionList[0], list):
+            try:
+                maxValue, restActions = CountValue().HandCardsValue(handCards, 0, curRank)
+                Strategy.SetRole(maxValue, restActions, curRank)
+                Strategy.makeReviseValues()
+            except Exception:
+                pass
+            pick = self._best_from_full_action_list(handCards, curRank, fullActionList, mode="restricted", formerAction=formerAction)
+            if pick is not None:
+                return pick
+
         actionList = CreateActionList().CreateList(handCards)
 
         additionalActionList = self.GetAdditionalActionList(["Bomb", "StraightFlush", "ThreePair", "Straight"], curRank,
@@ -172,7 +296,7 @@ class PlayCard():
                 restCards = CreateActionList().GetRestCards(action[2], handCards)
                 restValue, restActions = CountValue().HandCardsValue(restCards, 0, curRank)
                 #restValue += Strategy.handRV[type]
-                thisHandValue = CountValue().ActionValue(action[2], type, rank, curRank)
+                thisHandValue = CountValue().ActionValue(self._eval_cards_from_full_action(action), type, rank, curRank)
                 thisHandValue += Strategy.restrictedActionRV[type]
                 if (type, rank) in Strategy.restrictedActionRV.keys():
                     thisHandValue += Strategy.restrictedActionRV[(type, rank)]

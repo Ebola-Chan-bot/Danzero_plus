@@ -18,12 +18,14 @@ from __future__ import annotations
 import argparse
 import asyncio
 import glob
+import itertools
 import os
 import random
 import subprocess
 import sys
 import tempfile
 import time
+import threading
 from collections import Counter
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
@@ -46,6 +48,25 @@ from util import CardToNum, combine_handcards  # type: ignore
 
 Card = str
 Action = List  # [type, key, cards]
+
+# 全量重新开始（从选择级牌/先手/AI 手牌重新走）的跨线程信号。
+_RESTART_FULL_EVENT = threading.Event()
+
+
+def _adviser_card(cur_rank: str) -> Card:
+  # 参谋：红桃级牌
+  return f"H{cur_rank}"
+
+
+def _is_adviser(card: Card, cur_rank: str) -> bool:
+  return str(card) == _adviser_card(cur_rank)
+
+
+def _action_detail(action: Action) -> Dict[str, Any]:
+  # 可选的 action[3]：用于描述参谋补法等额外信息。
+  if isinstance(action, list) and len(action) >= 4 and isinstance(action[3], dict):
+    return action[3]
+  return {}
 
 
 class _GuiFallbackToTerminalThisTurn(Exception):
@@ -84,7 +105,7 @@ def format_cards_for_human(cards: List[Card]) -> str:
   return " ".join(parts)
 
 
-def format_action_for_human(action: Optional[Action]) -> str:
+def format_action_for_human(action: Optional[Action], cur_rank: Optional[str] = None) -> str:
   if not action or action[0] == "PASS":
     return "过"
 
@@ -96,10 +117,71 @@ def format_action_for_human(action: Optional[Action]) -> str:
     "ThreeWithTwo": "三带二",
     "TwoTrips": "钢板",
     "Straight": "顺子",
+    "StraightFlush": "同花顺",
     "Bomb": "炸弹",
   }.get(action[0], action[0])
 
-  return f"{type_ch}: {format_cards_for_human(action[2])}".strip()
+  extra = ""
+  try:
+    if cur_rank:
+      detail = _action_detail(action)
+      adv = detail.get("adviser_as")
+      cards = action[2] if isinstance(action, list) and len(action) >= 3 else []
+      adviser_count = sum(1 for c in cards if _is_adviser(c, cur_rank))
+      if adviser_count > 0:
+        adv_list: List[str] = []
+        if adv:
+          # adv 可以是 ['A'] 或 ['Q','Q'] 或 {'A':1,'Q':1}
+          if isinstance(adv, dict):
+            for r, n in adv.items():
+              adv_list.extend([str(r)] * int(n))
+          elif isinstance(adv, (list, tuple)):
+            adv_list = [str(x) for x in adv]
+
+        # 允许“参谋按本身点数使用”：此时 adv_list 可能比参谋张数短。
+        if adv_list:
+          if len(adv_list) < adviser_count:
+            adv_list.extend([str(cur_rank)] * (adviser_count - len(adv_list)))
+
+          # 压缩重复点数，保证输出简洁且无歧义。
+          cnt = Counter(adv_list)
+          ordered_unique: List[str] = []
+          seen = set()
+          for r in adv_list:
+            if r in seen:
+              continue
+            seen.add(r)
+            ordered_unique.append(r)
+
+          parts: List[str] = []
+          for r in ordered_unique:
+            n = int(cnt.get(r, 0))
+
+            rr = str(r)
+            try:
+              if (
+                len(rr) >= 2
+                and rr[0] in {"S", "H", "C", "D"}
+                and rr[-1] in set(RANKS_NO_JOKER)
+                and rr not in set(RANKS_NO_JOKER)
+              ):
+                rr = format_card_for_human(rr)
+            except Exception:
+              pass
+
+            if n <= 1:
+              parts.append(rr)
+            else:
+              parts.append(f"{rr}×{n}")
+
+          extra = f"（参谋当: {' '.join(parts)}）"
+        else:
+          # 没有 detail：提示可能存在歧义。
+          extra = "（含参谋）"
+  except Exception:
+    pass
+
+  return f"{type_ch}: {format_cards_for_human(action[2])}{extra}".strip()
 
 
 class _ScreenRoiSelector:
@@ -331,6 +413,15 @@ def _run_yolo_on_image(
     ]
     p = subprocess.run(cmd, cwd=repo_root, capture_output=True, text=True)
     if p.returncode != 0:
+      stderr = p.stderr or ""
+      if "No module named 'cv2'" in stderr or "ModuleNotFoundError" in stderr and "cv2" in stderr:
+        raise RuntimeError(
+          "YOLO 识别失败：缺少依赖 OpenCV（cv2）。\n\n"
+          "请用‘用户级’方式安装（不使用虚拟环境）：\n"
+          "  python -m pip install --user opencv-python\n\n"
+          "安装完成后重新点击‘截图框选识别’。\n\n"
+          "原始错误：\n" + stderr
+        )
       raise RuntimeError(
         "YOLO 识别失败：\n"
         + (p.stdout or "")
@@ -483,6 +574,10 @@ class _PersistentHumanActionPicker:
     self.detect_btn = tk.Button(action_bar, text="截图框选识别", command=self._on_detect_from_screen)
     self.detect_btn.pack(side="left", padx=(8, 0))
 
+    # 新增：一键取消当前局并重新开始
+    self.restart_btn = tk.Button(action_bar, text="重新开局", command=self._on_restart_game)
+    self.restart_btn.pack(side="left", padx=(8, 0))
+
     self.pass_btn = tk.Button(action_bar, text="PASS", command=self._on_pass)
     self.pass_btn.pack(side="left", padx=(8, 0))
     self.confirm_btn = tk.Button(action_bar, text="确认", command=self._on_confirm)
@@ -537,7 +632,7 @@ class _PersistentHumanActionPicker:
       if self.greater_action is None:
         self.context_var.set("首出：请选择要出的牌（不能 PASS）")
       else:
-        self.context_var.set(f"当前牌：{format_action_for_human(self.greater_action)}")
+            self.context_var.set(f"当前牌：{format_action_for_human(self.greater_action, self.cur_rank)}")
     else:
       self.info_var.set("")
       self.context_var.set("等待手动出牌…")
@@ -574,10 +669,12 @@ class _PersistentHumanActionPicker:
       self.undo_btn.configure(state="normal")
       self.confirm_btn.configure(state="normal")
       self.detect_btn.configure(state="normal")
+      self.restart_btn.configure(state="normal")
     elif self._mode == "human":
       self.undo_btn.configure(state="normal")
       self.confirm_btn.configure(state="normal")
       self.detect_btn.configure(state="normal")
+      self.restart_btn.configure(state="normal")
       if self.greater_action is None:
         self.pass_btn.configure(state="disabled")
       else:
@@ -587,6 +684,7 @@ class _PersistentHumanActionPicker:
       self.undo_btn.configure(state="disabled")
       self.confirm_btn.configure(state="disabled")
       self.detect_btn.configure(state="disabled")
+      self.restart_btn.configure(state="normal")
 
     # 窗口一旦变大后不再缩小。
     try:
@@ -647,9 +745,6 @@ class _PersistentHumanActionPicker:
     except Exception as e:
       messagebox.showerror("缺少依赖", f"截图需要 Pillow（PIL）。错误：{type(e).__name__}: {e}")
       return
-
-    # 提示用户把游戏窗口切到前台，避免把选牌窗口截进去。
-    messagebox.showinfo("准备截图", "请先切换到游戏画面/目标窗口，然后点击“确定”开始截图。")
 
     try:
       self.root.withdraw()
@@ -718,28 +813,56 @@ class _PersistentHumanActionPicker:
         target_count=target,
       )
 
-    # 覆盖当前选择（让用户可以再手动调整，然后点击“确认”）
+    # 覆盖当前选择
     self.selected = list(cards_sel)
     self.selected_count = Counter(self.selected)
     self._refresh_ui()
 
+    # 需求：框选后不再等待“确认”，直接生效。
     if self._mode == "ai_hand":
-      if len(cards_sel) != 27:
-        messagebox.showwarning(
-          "数量未满",
-          f"识别到 {len(cards_sel)} 张（需要 27 张）。你可以手动补齐，或重新框选更完整的区域。\n"
-          f"当前：{format_cards_for_human(cards_sel)}",
+      # AI 起手牌：识别到 27 张则直接提交；否则保留结果供手动补齐。
+      if len(cards_sel) == 27:
+        self._result_ai_hand = " ".join(cards_sel)
+        self._done_var.set(1)
+      return
+
+    # 人类出牌：直接按当前牌面规则校验并“打出”。
+    if self._mode == "human":
+      cards_snapshot = list(cards_sel)
+      if not cards_snapshot:
+        messagebox.showwarning("未识别到牌", "该区域未识别到任何牌，请重新框选或放大区域。")
+        return
+
+      need = Counter(cards_snapshot)
+      violated = []
+      for c, n in need.items():
+        avail = self._available_for(c)
+        if avail < n:
+          violated.append((c, n, avail))
+      if violated:
+        details = ", ".join([f"{format_card_for_human(c)} need={n} avail={a}" for c, n, a in violated])
+        messagebox.showerror("不可用", f"包含不可用的牌：{details}")
+        return
+
+      try:
+        act = _resolve_action_with_adviser(
+          cards_snapshot,
+          cur_rank=self.cur_rank,
+          greater_action=self.greater_action,
+          tk_parent=self.root,
+          allow_interactive=True,
         )
-      else:
-        messagebox.showinfo("识别完成", f"已识别并填入 27 张：\n{format_cards_for_human(cards_sel)}")
-    else:
-      extra = ""
-      if dropped:
-        extra = f"\n\n注意：有 {len(dropped)} 张因不可用/超出上限被丢弃。"
-      messagebox.showinfo(
-        "识别完成",
-        f"已识别并填入 {len(cards_sel)} 张（本座位最多 {target} 张）。{extra}\n\n当前：{format_cards_for_human(cards_sel)}",
-      )
+      except Exception as e:
+        messagebox.showerror("牌型无效", str(e))
+        return
+
+      if not beats(act, self.greater_action, self.cur_rank):
+        messagebox.showerror("不压过", "不压过当前牌（或牌型不匹配）。")
+        return
+
+      self._result_action = act
+      self._done_var.set(1)
+      return
 
   def _on_pass(self):
     if self._mode != "human":
@@ -747,6 +870,17 @@ class _PersistentHumanActionPicker:
     if self.greater_action is None:
       return
     self._result_action = ["PASS", "PASS", []]
+    self._done_var.set(1)
+
+  def _on_restart_game(self):
+    # 全量重新开始：任何时候都可用。
+    _RESTART_FULL_EVENT.set()
+    # 若当前正等待出牌/选牌，立刻解除阻塞。
+    if self._mode == "human":
+      self._result_action = ["RESTART_FULL", "RESTART_FULL", []]
+    elif self._mode == "ai_hand":
+      self._result_ai_hand = ""
+      self._closed_for_turn = True
     self._done_var.set(1)
 
   def _on_confirm(self):
@@ -781,7 +915,13 @@ class _PersistentHumanActionPicker:
       return
 
     try:
-      act = classify_action(cards_snapshot, self.cur_rank)
+      act = _resolve_action_with_adviser(
+        cards_snapshot,
+        cur_rank=self.cur_rank,
+        greater_action=self.greater_action,
+        tk_parent=self.root,
+        allow_interactive=True,
+      )
     except Exception as e:
       messagebox.showerror("牌型无效", str(e))
       return
@@ -978,6 +1118,189 @@ BASE_RANK_VALUE = {
 }
 
 
+RANKS_NO_JOKER = list("23456789TJQKA")
+
+# 参谋可变成王以外的任何牌：点数 + 花色均可变（不含 Joker）。
+ALL_NON_JOKER_CARDS = [f"{s}{r}" for s in "SHCD" for r in RANKS_NO_JOKER]
+
+
+def _action_key_from_action(action: Action, cur_rank: str) -> Tuple[int, int]:
+  """Return (strength_key, length) using the declared action, not raw card ranks.
+
+  This avoids ambiguity when actions contain 参谋（红桃级牌）作为癞子补牌。
+  """
+  if not action or action[0] == "PASS":
+    return (0, 0)
+  t = action[0]
+  k = action[1]
+  ln = len(action[2]) if isinstance(action, list) and len(action) >= 3 else 0
+
+  if t in {"Single", "Pair", "Trips", "Bomb"}:
+    return (rank_value(str(k), cur_rank), ln)
+
+  if t == "ThreeWithTwo":
+    return (rank_value(str(k), cur_rank), 5)
+
+  if t == "Straight":
+    # key 用最高点数（A2345 时为 '5'）
+    kk = str(k)
+    if kk == "5":
+      return (BASE_RANK_VALUE["5"], 5)
+    return (BASE_RANK_VALUE.get(kk, 0), 5)
+
+  if t == "StraightFlush":
+    # 同花顺：比较规则同顺子（key 用最高点数，A2345 时为 '5'）
+    kk = str(k)
+    if kk == "5":
+      return (BASE_RANK_VALUE["5"], 5)
+    return (BASE_RANK_VALUE.get(kk, 0), 5)
+
+  if t == "ThreePair":
+    # key 是最小点数，比较时以最大点数为准（跨度 2）
+    kk = str(k)
+    # 特例：A23（三连对中 A 与 2 相连视为最小）
+    if kk == "A":
+      return (BASE_RANK_VALUE["3"], 6)
+    return (BASE_RANK_VALUE.get(kk, 0) + 2, 6)
+
+  if t == "TwoTrips":
+    # key 是最小点数，比较时以最大点数为准（跨度 1）
+    kk = str(k)
+    # 特例：A2（钢板中 A 与 2 相连视为最小）
+    if kk == "A":
+      return (BASE_RANK_VALUE["2"], 6)
+    return (BASE_RANK_VALUE.get(kk, 0) + 1, 6)
+
+  # 兜底：回退到 key
+  return (rank_value(str(k), cur_rank), ln)
+
+
+def _resolve_action_with_adviser(
+  cards: List[Card],
+  *,
+  cur_rank: str,
+  greater_action: Optional[Action] = None,
+  tk_parent=None,
+  allow_interactive: bool = True,
+) -> Action:
+  """Resolve an input card list into a single declared Action.
+
+  - 无参谋：等价于 classify_action(cards)
+  - 有参谋：枚举参谋补法；
+      - 0 种：拒绝
+      - 1 种：采用
+      - 多种：弹窗/终端提示选择
+  """
+  adviser = _adviser_card(cur_rank)
+  adv_idx = [i for i, c in enumerate(cards) if c == adviser]
+  if not adv_idx:
+    return classify_action(cards, cur_rank)
+
+  # 枚举参谋->任意非 Joker 牌 的替代（点数+花色均可变）。
+  options: List[Action] = []
+  seen = set()
+
+  for cards_as in itertools.product(ALL_NON_JOKER_CARDS, repeat=len(adv_idx)):
+    virtual = list(cards)
+    for j, c_as in enumerate(cards_as):
+      virtual[adv_idx[j]] = str(c_as)
+    try:
+      act_v = classify_action(virtual, cur_rank)
+    except Exception:
+      continue
+
+    # 用虚拟牌面去重：同一声明动作 + 同一虚拟牌面视为同一种补法
+    sig = (act_v[0], act_v[1], tuple(sorted(virtual)))
+    if sig in seen:
+      continue
+    seen.add(sig)
+
+    act = [act_v[0], act_v[1], list(cards)]
+    # 记录参谋补法（记录参谋变成的牌面，含花色）
+    detail: Dict[str, Any] = {}
+    # 参谋按本身牌面（H+cur_rank）不额外标注；只有发生替换时才标注。
+    adv_as_cards = [c for c in cards_as if str(c) != adviser]
+    if adv_as_cards:
+      detail["adviser_as"] = list(adv_as_cards)
+    detail["virtual_ranks"] = [c[-1] for c in virtual]
+    detail["virtual_cards"] = list(virtual)
+    if detail:
+      act.append(detail)
+    options.append(act)
+
+  if not options:
+    raise ValueError("包含参谋，但不存在任何合法补法。")
+
+  # 跟牌场景：只保留能压过当前牌的补法，避免“先选参谋方案，后提示压不过”。
+  if greater_action and isinstance(greater_action, list) and greater_action[0] != "PASS":
+    beatable = [a for a in options if beats(a, greater_action, cur_rank)]
+    if beatable:
+      options = beatable
+    else:
+      raise ValueError("这手牌无论参谋怎么当，都压不过当前牌（需要更大的同类牌型或炸弹/同花顺）。")
+
+  if len(options) == 1 or not allow_interactive:
+    return options[0]
+
+  # 多解：让用户选择。
+  try:
+    import tkinter as tk  # noqa: F401
+    from tkinter import simpledialog
+
+    lines = []
+    for i, a in enumerate(options, 1):
+      d = _action_detail(a)
+      adv = d.get("adviser_as")
+      adv_s = ""
+      if adv:
+        if isinstance(adv, (list, tuple)):
+          def _disp(x: Any) -> str:
+            s = str(x)
+            try:
+              if (
+                len(s) >= 2
+                and s[0] in {"S", "H", "C", "D"}
+                and s[-1] in set(RANKS_NO_JOKER)
+                and s not in set(RANKS_NO_JOKER)
+              ):
+                return format_card_for_human(s)
+            except Exception:
+              pass
+            return s
+
+          adv_s = f" 参谋当:{' '.join([_disp(x) for x in adv])}"
+        elif isinstance(adv, dict):
+          adv_s = " 参谋当:" + " ".join([f"{k}×{v}" if int(v) > 1 else str(k) for k, v in adv.items()])
+      lines.append(f"{i}) {format_action_for_human(a, cur_rank)}{adv_s}")
+
+    msg = "这手牌包含参谋，存在多种合法补法，请选择一种：\n\n" + "\n".join(lines)
+    pick = simpledialog.askinteger(
+      "选择参谋补法",
+      msg,
+      minvalue=1,
+      maxvalue=len(options),
+      parent=tk_parent,
+    )
+    if not pick:
+      raise ValueError("已取消选择参谋补法。")
+    return options[int(pick) - 1]
+  except Exception:
+    # Tk 不可用：回退到终端选择。
+    print("这手牌包含参谋，存在多种合法补法，请选择：")
+    for i, a in enumerate(options, 1):
+      print(f"  {i}) {format_action_for_human(a, cur_rank)}")
+    while True:
+      s = input(f"请输入 1-{len(options)}（空=取消）：").strip()
+      if not s:
+        raise ValueError("已取消选择参谋补法。")
+      try:
+        v = int(s)
+      except Exception:
+        continue
+      if 1 <= v <= len(options):
+        return options[v - 1]
+
+
 def rank_value(rank_char: str, cur_rank: str) -> int:
   if rank_char == cur_rank:
     return 15
@@ -1055,16 +1378,22 @@ def classify_action(cards: List[Card], cur_rank: str) -> Action:
   # 三连对（3 个连续对子）
   if n == 6 and sorted(counts.values()) == [2, 2, 2]:
     # 显示用最小点数作为 key；比较时会用计算得到的比较值。
-    ordered = sorted(counts.keys(), key=lambda r: rank_value(r, cur_rank))
+    ordered = sorted(counts.keys(), key=lambda r: BASE_RANK_VALUE.get(r, 99))
     # 按点数检查是否连续
-    vals = [rank_value(r, cur_rank) for r in ordered]
+    vals = [BASE_RANK_VALUE[r] for r in ordered]
+    # A23：A 与 2 相连视为最小
+    if set(vals) == {14, 2, 3}:
+      return ["ThreePair", "A", cards]
     if vals[0] + 1 == vals[1] and vals[1] + 1 == vals[2]:
       return ["ThreePair", ordered[0], cards]
 
   # 钢板（2 个连续三张）
   if n == 6 and sorted(counts.values()) == [3, 3]:
-    ordered = sorted(counts.keys(), key=lambda r: rank_value(r, cur_rank))
-    vals = [rank_value(r, cur_rank) for r in ordered]
+    ordered = sorted(counts.keys(), key=lambda r: BASE_RANK_VALUE.get(r, 99))
+    vals = [BASE_RANK_VALUE[r] for r in ordered]
+    # A2：A 与 2 相连视为最小
+    if set(vals) == {14, 2}:
+      return ["TwoTrips", "A", cards]
     if vals[0] + 1 == vals[1]:
       return ["TwoTrips", ordered[0], cards]
 
@@ -1072,8 +1401,11 @@ def classify_action(cards: List[Card], cur_rank: str) -> Action:
   if n == 5 and all(c == 1 for c in counts.values()):
     ordered = sorted(counts.keys(), key=lambda r: BASE_RANK_VALUE.get(r, 99))
     vals = [BASE_RANK_VALUE[r] for r in ordered]
+    suits = [c[0] for c in cards]
     # A2345
     if set(vals) == {14, 2, 3, 4, 5}:
+      if len(set(suits)) == 1:
+        return ["StraightFlush", "5", cards]
       return ["Straight", "5", cards]
     vals_sorted = sorted(vals)
     if (
@@ -1086,9 +1418,13 @@ def classify_action(cards: List[Card], cur_rank: str) -> Action:
       high_val = vals_sorted[-1]
       inv = {v: k for k, v in BASE_RANK_VALUE.items() if k in list("23456789TJQKA")}
       key = inv.get(high_val, ordered[-1])
+      if len(set(suits)) == 1:
+        return ["StraightFlush", key, cards]
       return ["Straight", key, cards]
 
-  raise ValueError("无法识别牌型（仅支持: PASS/Single/Pair/Trips/Bomb/Straight/ThreeWithTwo/ThreePair/TwoTrips）")
+  raise ValueError(
+    "无法识别牌型（仅支持: PASS/Single/Pair/Trips/Bomb/Straight/StraightFlush/ThreeWithTwo/ThreePair/TwoTrips）"
+  )
 
 
 def beats(action: Action, greater_action: Optional[Action], cur_rank: str) -> bool:
@@ -1101,15 +1437,36 @@ def beats(action: Action, greater_action: Optional[Action], cur_rank: str) -> bo
   if greater_action[0] == "PASS":
     return action[0] != "PASS"
 
-  # 炸弹压过所有非炸弹。
-  if action[0] == "Bomb" and greater_action[0] != "Bomb":
+  def _is_bomb_like(a: Action) -> bool:
+    try:
+      return a[0] in {"Bomb", "StraightFlush"}
+    except Exception:
+      return False
+
+  def _bomb_strength(a: Action) -> Tuple[int, int]:
+    # 同花顺视为“5.5 炸”：大于五炸，小于六炸。
+    t = a[0]
+    ln = len(a[2]) if isinstance(a, list) and len(a) >= 3 else 0
+    if t == "StraightFlush":
+      size_rank = 55
+      key, _ = _action_key_from_action(a, cur_rank)
+      return (size_rank, int(key))
+    # 普通炸弹：按张数排序
+    size_rank = int(ln) * 10
+    key, _ = _action_key_from_action(a, cur_rank)
+    return (size_rank, int(key))
+
+  # 炸弹类压过所有非炸弹类。
+  if _is_bomb_like(action) and not _is_bomb_like(greater_action):
     return True
+  if _is_bomb_like(action) and _is_bomb_like(greater_action):
+    return _bomb_strength(action) > _bomb_strength(greater_action)
 
   if action[0] != greater_action[0]:
     return False
 
-  a_key, a_len = action_key_from_cards(action[2], cur_rank)
-  g_key, g_len = action_key_from_cards(greater_action[2], cur_rank)
+  a_key, a_len = _action_key_from_action(action, cur_rank)
+  g_key, g_len = _action_key_from_action(greater_action, cur_rank)
 
   # 同类型必须长度一致。
   if a_len != g_len:
@@ -1119,64 +1476,341 @@ def beats(action: Action, greater_action: Optional[Action], cur_rank: str) -> bo
 
 
 def generate_actions_from_hand(hand: List[Card], cur_rank: str) -> List[Action]:
-  # 遵循 torch 客户端的动作表示：[type, key, cards]
-  card_value_s2v = dict(BASE_RANK_VALUE)
-  card_value_s2v[cur_rank] = 15
+  # 遵循客户端动作表示：[type, key, cards]。
+  # 当包含参谋（红桃级牌）且发生补牌时，会在 action[3] 追加补法信息。
+  adviser = _adviser_card(cur_rank)
+  advisers = [c for c in hand if c == adviser]
+  w = len(advisers)
+  others = [c for c in hand if c != adviser]
 
-  sorted_cards, bomb_info = combine_handcards(hand, cur_rank, card_value_s2v)
+  by_rank: Dict[str, List[Card]] = {}
+  for c in others:
+    by_rank.setdefault(c[-1], []).append(c)
+  for v in by_rank.values():
+    v.sort()
 
-  actions: List[Action] = []
+  out: List[Action] = []
+  seen = set()
 
-  # 单张、对子、三张
-  for c in sorted_cards.get("Single", []):
-    actions.append(["Single", c[-1], [c]])
-  for pair in sorted_cards.get("Pair", []):
-    actions.append(["Pair", pair[0][-1], pair])
-  for trips in sorted_cards.get("Trips", []):
-    actions.append(["Trips", trips[0][-1], trips])
+  def push(t: str, k: str, cards: List[Card], detail: Optional[Dict[str, Any]] = None):
+    sig = (t, k, tuple(sorted(cards)))
+    if sig in seen:
+      return
+    seen.add(sig)
+    a: Action = [t, k, cards]
+    if detail:
+      a.append(detail)
+    out.append(a)
 
-  # 顺子/连续结构已由 util.combine_handcards 生成
-  for st in sorted_cards.get("Straight", []) or []:
-    actions.append(["Straight", st[0][-1], st])
+  # 单张：去重即可（两副牌同牌面视为等价选择）
+  for c in sorted(set(hand)):
+    push("Single", c[-1], [c])
 
-  # 三带二
-  if sorted_cards.get("Pair") and sorted_cards.get("Trips"):
-    for t in sorted_cards["Trips"]:
-      for p in sorted_cards["Pair"]:
-        actions.append(["ThreeWithTwo", t[0][-1], t + p])
+  # 同点数：对子/三张/炸弹。Joker 不允许参谋补。
+  ranks_in_hand = sorted(set([c[-1] for c in others] + ["B", "R"]))
+  for r in ranks_in_hand:
+    base_cards = by_rank.get(r, [])
+    can_use_adv = r in RANKS_NO_JOKER
 
-  # 三连对
-  pair_actions = []
-  for pair in sorted_cards.get("Pair", []) or []:
-    pair_actions.append(["Pair", pair[0][-1], pair])
+    for need, typ in [(2, "Pair"), (3, "Trips")]:
+      max_total = len(base_cards) + (w if can_use_adv else 0)
+      if max_total < need:
+        continue
+      for adv_use in range(0, min(w if can_use_adv else 0, need) + 1):
+        take = need - adv_use
+        if len(base_cards) < take:
+          continue
+        cards = base_cards[:take] + advisers[:adv_use]
+        detail = None
+        if adv_use > 0 and r != cur_rank:
+          detail = {"adviser_as": [r] * adv_use}
+        if adv_use > 0:
+          d = detail if detail is not None else {}
+          d["virtual_ranks"] = [r] * len(cards)
+          detail = d
+        push(typ, r, cards, detail)
 
-  pair_actions.sort(key=lambda a: rank_value(a[1], cur_rank))
-  for i in range(len(pair_actions) - 2):
-    v0 = rank_value(pair_actions[i][1], cur_rank)
-    v1 = rank_value(pair_actions[i + 1][1], cur_rank)
-    v2 = rank_value(pair_actions[i + 2][1], cur_rank)
-    if v0 + 1 == v1 and v1 + 1 == v2:
-      cards = pair_actions[i][2] + pair_actions[i + 1][2] + pair_actions[i + 2][2]
-      actions.append(["ThreePair", pair_actions[i][1], cards])
+    max_total = len(base_cards) + (w if can_use_adv else 0)
+    if max_total >= 4:
+      for size in range(4, max_total + 1):
+        for adv_use in range(0, min(w if can_use_adv else 0, size) + 1):
+          take = size - adv_use
+          if len(base_cards) < take:
+            continue
+          cards = base_cards[:take] + advisers[:adv_use]
+          detail = None
+          if adv_use > 0 and r != cur_rank:
+            detail = {"adviser_as": [r] * adv_use}
+          if adv_use > 0:
+            d = detail if detail is not None else {}
+            d["virtual_ranks"] = [r] * len(cards)
+            detail = d
+          push("Bomb", r, cards, detail)
 
-  # 钢板
-  trips_actions = []
-  for t in sorted_cards.get("Trips", []) or []:
-    trips_actions.append(["Trips", t[0][-1], t])
-  trips_actions.sort(key=lambda a: rank_value(a[1], cur_rank))
-  for i in range(len(trips_actions) - 1):
-    v0 = rank_value(trips_actions[i][1], cur_rank)
-    v1 = rank_value(trips_actions[i + 1][1], cur_rank)
-    if v0 + 1 == v1:
-      cards = trips_actions[i][2] + trips_actions[i + 1][2]
-      actions.append(["TwoTrips", trips_actions[i][1], cards])
+  # 三带二：参谋可分配到三张或对子。
+  for trip_r in RANKS_NO_JOKER:
+    for pair_r in RANKS_NO_JOKER:
+      if pair_r == trip_r:
+        continue
+      trip_cards = by_rank.get(trip_r, [])
+      pair_cards = by_rank.get(pair_r, [])
+      for adv_t in range(0, min(w, 3) + 1):
+        for adv_p in range(0, min(w - adv_t, 2) + 1):
+          if len(trip_cards) < 3 - adv_t:
+            continue
+          if len(pair_cards) < 2 - adv_p:
+            continue
+          cards = (
+            trip_cards[: (3 - adv_t)]
+            + advisers[:adv_t]
+            + pair_cards[: (2 - adv_p)]
+            + advisers[adv_t : adv_t + adv_p]
+          )
+          adv_as: List[str] = []
+          if adv_t and trip_r != cur_rank:
+            adv_as += [trip_r] * adv_t
+          if adv_p and pair_r != cur_rank:
+            adv_as += [pair_r] * adv_p
+          detail = {"adviser_as": adv_as} if adv_as else {}
+          if adv_t or adv_p:
+            # cards 的顺序与拼接一致：先三张再对子
+            detail["virtual_ranks"] = [trip_r] * 3 + [pair_r] * 2
+          if not detail:
+            detail = None
+          push("ThreeWithTwo", trip_r, list(cards), detail)
 
-  # 炸弹（同点数 4 张及以上）
-  for bomb_cards in sorted_cards.get("Bomb", []) or []:
-    actions.append(["Bomb", bomb_cards[0][-1], bomb_cards])
+  # 顺子（长度 5，允许 A2345）：参谋既可补缺失，也可替换已有点数。
+  base_order = list("23456789TJQKA")
+  seqs: List[List[str]] = []
+  for i in range(0, len(base_order) - 4):
+    seqs.append(base_order[i : i + 5])
+  seqs.append(["A", "2", "3", "4", "5"])  # 特例
 
-  # 尽量稳定（可复现）的排序
-  def sort_key(a: Action) -> Tuple[int, int, str]:
+  for ranks in seqs:
+    missing = [r for r in ranks if len(by_rank.get(r, [])) == 0]
+    if len(missing) > w:
+      continue
+    for adv_use in range(len(missing), min(w, 5) + 1):
+      for adv_pos in itertools.combinations(range(5), adv_use):
+        # 必须覆盖缺失点数
+        ok = True
+        for r in missing:
+          if ranks.index(r) not in adv_pos:
+            ok = False
+            break
+        if not ok:
+          continue
+        cards: List[Card] = []
+        adv_as: List[str] = []
+        vranks: List[str] = []
+        adv_taken = 0
+        for idx, r in enumerate(ranks):
+          if idx in adv_pos:
+            cards.append(advisers[adv_taken])
+            if r != cur_rank:
+              adv_as.append(r)
+            adv_taken += 1
+          else:
+            cards.append(by_rank[r][0])
+          vranks.append(r)
+        key = "5" if set(ranks) == {"A", "2", "3", "4", "5"} else ranks[-1]
+        detail = {"adviser_as": adv_as} if adv_as else {}
+        if adv_use > 0:
+          detail["virtual_ranks"] = vranks
+        if not detail:
+          detail = None
+        push("Straight", key, cards, detail)
+
+  # 同花顺（长度 5）：同顺子，但要求同花色；参谋可变花色，因此可用于任意花色的同花顺。
+  for suit in ["S", "H", "C", "D"]:
+    by_rank_suit: Dict[str, List[Card]] = {}
+    for c in others:
+      if c[0] != suit:
+        continue
+      by_rank_suit.setdefault(c[-1], []).append(c)
+    for v in by_rank_suit.values():
+      v.sort()
+
+    suit_adv = w
+    if suit_adv == 0 and not by_rank_suit:
+      continue
+
+    for ranks in seqs:
+      missing = [r for r in ranks if len(by_rank_suit.get(r, [])) == 0]
+      if len(missing) > suit_adv:
+        continue
+      for adv_use in range(len(missing), min(suit_adv, 5) + 1):
+        for adv_pos in itertools.combinations(range(5), adv_use):
+          ok = True
+          for r in missing:
+            if ranks.index(r) not in adv_pos:
+              ok = False
+              break
+          if not ok:
+            continue
+          cards: List[Card] = []
+          adv_as: List[str] = []
+          vranks: List[str] = []
+          vcards: List[str] = []
+          adv_taken = 0
+          for idx, r in enumerate(ranks):
+            if idx in adv_pos:
+              cards.append(advisers[adv_taken])
+              # 记录参谋变成的目标牌面（含花色），用于无歧义展示。
+              vcards.append(f"{suit}{r}")
+              if f"H{cur_rank}" != f"{suit}{r}":
+                adv_as.append(f"{suit}{r}")
+              adv_taken += 1
+            else:
+              cards.append(by_rank_suit[r][0])
+              vcards.append(by_rank_suit[r][0])
+            vranks.append(r)
+          key = "5" if set(ranks) == {"A", "2", "3", "4", "5"} else ranks[-1]
+          detail = {"adviser_as": adv_as} if adv_as else {}
+          if adv_use > 0:
+            detail["virtual_ranks"] = vranks
+            detail["virtual_cards"] = vcards
+          if not detail:
+            detail = None
+          push("StraightFlush", key, cards, detail)
+
+  # 三连对（3 个连续对子）：参谋可补/替换。
+  ordered = sorted(RANKS_NO_JOKER, key=lambda r: BASE_RANK_VALUE.get(r, 99))
+  for i in range(0, len(ordered) - 2):
+    r0, r1, r2 = ordered[i], ordered[i + 1], ordered[i + 2]
+    if not (
+      BASE_RANK_VALUE.get(r0, 99) + 1 == BASE_RANK_VALUE.get(r1, 99)
+      and BASE_RANK_VALUE.get(r1, 99) + 1 == BASE_RANK_VALUE.get(r2, 99)
+    ):
+      continue
+    # 分配参谋到三对中（每对最多 2）
+    for use0 in range(0, min(w, 2) + 1):
+      for use1 in range(0, min(w - use0, 2) + 1):
+        for use2 in range(0, min(w - use0 - use1, 2) + 1):
+          use_total = use0 + use1 + use2
+          if use_total > w:
+            continue
+          if len(by_rank.get(r0, [])) < 2 - use0:
+            continue
+          if len(by_rank.get(r1, [])) < 2 - use1:
+            continue
+          if len(by_rank.get(r2, [])) < 2 - use2:
+            continue
+          cards = (
+            by_rank.get(r0, [])[: (2 - use0)]
+            + advisers[:use0]
+            + by_rank.get(r1, [])[: (2 - use1)]
+            + advisers[use0 : use0 + use1]
+            + by_rank.get(r2, [])[: (2 - use2)]
+            + advisers[use0 + use1 : use0 + use1 + use2]
+          )
+          adv_as: List[str] = []
+          if use0 and r0 != cur_rank:
+            adv_as += [r0] * use0
+          if use1 and r1 != cur_rank:
+            adv_as += [r1] * use1
+          if use2 and r2 != cur_rank:
+            adv_as += [r2] * use2
+          detail = {"adviser_as": adv_as} if adv_as else {}
+          if use_total > 0:
+            detail["virtual_ranks"] = [r0, r0, r1, r1, r2, r2]
+          if not detail:
+            detail = None
+          push("ThreePair", r0, list(cards), detail)
+
+  # 三连对特例：A23（A 与 2 相连视为最小）
+  r0, r1, r2 = "A", "2", "3"
+  for use0 in range(0, min(w, 2) + 1):
+    for use1 in range(0, min(w - use0, 2) + 1):
+      for use2 in range(0, min(w - use0 - use1, 2) + 1):
+        use_total = use0 + use1 + use2
+        if use_total > w:
+          continue
+        if len(by_rank.get(r0, [])) < 2 - use0:
+          continue
+        if len(by_rank.get(r1, [])) < 2 - use1:
+          continue
+        if len(by_rank.get(r2, [])) < 2 - use2:
+          continue
+        cards = (
+          by_rank.get(r0, [])[: (2 - use0)]
+          + advisers[:use0]
+          + by_rank.get(r1, [])[: (2 - use1)]
+          + advisers[use0 : use0 + use1]
+          + by_rank.get(r2, [])[: (2 - use2)]
+          + advisers[use0 + use1 : use0 + use1 + use2]
+        )
+        adv_as: List[str] = []
+        if use0 and r0 != cur_rank:
+          adv_as += [r0] * use0
+        if use1 and r1 != cur_rank:
+          adv_as += [r1] * use1
+        if use2 and r2 != cur_rank:
+          adv_as += [r2] * use2
+        detail = {"adviser_as": adv_as} if adv_as else {}
+        if use_total > 0:
+          detail["virtual_ranks"] = [r0, r0, r1, r1, r2, r2]
+        if not detail:
+          detail = None
+        push("ThreePair", "A", list(cards), detail)
+
+  # 钢板（2 个连续三张）：参谋可补/替换。
+  for i in range(0, len(ordered) - 1):
+    r0, r1 = ordered[i], ordered[i + 1]
+    if BASE_RANK_VALUE.get(r0, 99) + 1 != BASE_RANK_VALUE.get(r1, 99):
+      continue
+    for use0 in range(0, min(w, 3) + 1):
+      for use1 in range(0, min(w - use0, 3) + 1):
+        if len(by_rank.get(r0, [])) < 3 - use0:
+          continue
+        if len(by_rank.get(r1, [])) < 3 - use1:
+          continue
+        cards = (
+          by_rank.get(r0, [])[: (3 - use0)]
+          + advisers[:use0]
+          + by_rank.get(r1, [])[: (3 - use1)]
+          + advisers[use0 : use0 + use1]
+        )
+        adv_as: List[str] = []
+        if use0 and r0 != cur_rank:
+          adv_as += [r0] * use0
+        if use1 and r1 != cur_rank:
+          adv_as += [r1] * use1
+        detail = {"adviser_as": adv_as} if adv_as else {}
+        if (use0 + use1) > 0:
+          detail["virtual_ranks"] = [r0, r0, r0, r1, r1, r1]
+        if not detail:
+          detail = None
+        push("TwoTrips", r0, list(cards), detail)
+
+  # 钢板特例：A2（A 与 2 相连视为最小）
+  r0, r1 = "A", "2"
+  for use0 in range(0, min(w, 3) + 1):
+    for use1 in range(0, min(w - use0, 3) + 1):
+      if len(by_rank.get(r0, [])) < 3 - use0:
+        continue
+      if len(by_rank.get(r1, [])) < 3 - use1:
+        continue
+      cards = (
+        by_rank.get(r0, [])[: (3 - use0)]
+        + advisers[:use0]
+        + by_rank.get(r1, [])[: (3 - use1)]
+        + advisers[use0 : use0 + use1]
+      )
+      adv_as: List[str] = []
+      if use0 and r0 != cur_rank:
+        adv_as += [r0] * use0
+      if use1 and r1 != cur_rank:
+        adv_as += [r1] * use1
+      detail = {"adviser_as": adv_as} if adv_as else {}
+      if (use0 + use1) > 0:
+        detail["virtual_ranks"] = [r0, r0, r0, r1, r1, r1]
+      if not detail:
+        detail = None
+      push("TwoTrips", "A", list(cards), detail)
+
+  # 稳定排序（用声明动作的 key/长度）
+  def sort_key(a: Action) -> Tuple[int, int, int, str]:
     t = a[0]
     type_order = {
       "Single": 1,
@@ -1188,11 +1822,11 @@ def generate_actions_from_hand(hand: List[Card], cur_rank: str) -> List[Action]:
       "Straight": 7,
       "Bomb": 8,
     }.get(t, 99)
-    k, ln = action_key_from_cards(a[2], cur_rank)
-    return (type_order, ln, str(k))
+    k, ln = _action_key_from_action(a, cur_rank)
+    return (type_order, ln, k, str(a[1]))
 
-  actions.sort(key=sort_key)
-  return actions
+  out.sort(key=sort_key)
+  return out
 
 
 @dataclass
@@ -1209,14 +1843,12 @@ class MiniDanServer:
     self_rank: str,
     oppo_rank: str,
     ai_hand: List[Card],
-    max_steps: int,
     start_pos: int,
   ):
     self.cur_rank = cur_rank
     self.self_rank = self_rank
     self.oppo_rank = oppo_rank
     self.ai_hand = ai_hand[:]  # 座位 seat0
-    self.max_steps = max_steps
 
     self.seat_conns: Dict[int, SeatConn] = {}
 
@@ -1262,6 +1894,16 @@ class MiniDanServer:
       },
     )
 
+  def reset_for_new_game(self, *, ai_hand: List[Card], start_pos: int):
+    # 重置对局状态（保留连接）。
+    self.ai_hand = ai_hand[:]
+    self.played_cards = Counter()
+    self.human_remaining = {1: 27, 2: 27, 3: 27}
+    self.current_pos = int(start_pos)
+    self.greater_action = None
+    self.greater_pos = None
+    self.passes_since_play = 0
+
   def prompt_human_action(self, seat: int) -> Action:
     # 优先使用 GUI 选牌。
     try:
@@ -1275,11 +1917,6 @@ class MiniDanServer:
         played_cards=self.played_cards,
         greater_action=self.greater_action,
       )
-      # 将 GUI 中的选择结果回显到终端。
-      if act[0] == "PASS":
-        print(f"Seat{seat}（窗口）选择：过")
-      else:
-        print(f"Seat{seat}（窗口）选择：{format_action_for_human(act)}")
       return act
     except _GuiFallbackToTerminalThisTurn:
       # 本回合用户关闭窗口，回退到终端输入。
@@ -1296,7 +1933,7 @@ class MiniDanServer:
         prompt = f"Seat{seat}（剩余 {remaining} 张）出牌（如: ♥3 ♥3 或 ♦10）："
       else:
         prompt = (
-          f"Seat{seat}（剩余 {remaining} 张）跟牌（可 PASS）。当前牌: {format_action_for_human(self.greater_action)}："
+          f"Seat{seat}（剩余 {remaining} 张）跟牌（可 PASS）。当前牌: {format_action_for_human(self.greater_action, self.cur_rank)}："
         )
 
       s = input(prompt).strip()
@@ -1360,7 +1997,12 @@ class MiniDanServer:
         continue
 
       try:
-        act = classify_action(cards, self.cur_rank)
+        act = _resolve_action_with_adviser(
+          cards,
+          cur_rank=self.cur_rank,
+          greater_action=self.greater_action,
+          allow_interactive=True,
+        )
       except Exception as e:
         print(f"无效输入: {e}")
         continue
@@ -1371,7 +2013,7 @@ class MiniDanServer:
 
       return act
 
-  async def run_game_loop(self):
+  async def run_game_loop(self) -> str:
     # 当前实现：只要求 seat0 连接即可开局。
     if 0 not in self.seat_conns:
       raise RuntimeError("需要 seat0 连接到 /game/client0")
@@ -1379,10 +2021,11 @@ class MiniDanServer:
     # 连接后发送 beginning。
     await self.send_beginning(0)
 
-    steps = 0
     stopped_early = False
-    while steps < self.max_steps:
-      steps += 1
+    while True:
+
+      if _RESTART_FULL_EVENT.is_set():
+        return "restart_full"
 
       greater_pos_payload = self.greater_pos if self.greater_pos is not None else -1
       greater_action_payload = self.greater_action if self.greater_action is not None else ["PASS", "PASS", []]
@@ -1442,6 +2085,9 @@ class MiniDanServer:
           print("输入中断，实验服将停止。")
           stopped_early = True
           break
+
+        if act and isinstance(act, list) and act[0] == "RESTART_FULL":
+          return "restart_full"
         if act[0] != "PASS":
           self.human_remaining[self.current_pos] = max(
             0, self.human_remaining.get(self.current_pos, 27) - len(act[2])
@@ -1489,8 +2135,15 @@ class MiniDanServer:
         stopped_early = True
         break
 
-    if not stopped_early and steps >= self.max_steps:
-      print("达到 max_steps，实验服将停止。")
+      # 结束条件：
+      # - AI 出完牌
+      # - AI 没出完，但敌方已出完（seat1 和 seat3 都出完）
+      if int(self.human_remaining.get(1, 27)) <= 0 and int(self.human_remaining.get(3, 27)) <= 0:
+        print("敌方（Seat1/Seat3）已出完牌（实验服将停止）。")
+        stopped_early = True
+        break
+
+    return "stopped" if stopped_early else "finished"
 
 
 async def handler(ws: ServerConnection, server: MiniDanServer):
@@ -1527,8 +2180,8 @@ async def main_async(args):
       f"错误：{type(e).__name__}: {e}"
     )
 
+  # 首局 AI 手牌：允许从参数/GUI 输入；后续“重新开局”默认随机发牌。
   deck = make_double_deck()
-
   while True:
     ai_hand = parse_cards_csv(getattr(args, "ai_hand", ""))
     if not ai_hand:
@@ -1555,7 +2208,6 @@ async def main_async(args):
     self_rank=args.self_rank,
     oppo_rank=args.oppo_rank,
     ai_hand=ai_hand,
-    max_steps=args.max_steps,
     start_pos=getattr(args, "start_pos", 0),
   )
 
@@ -1604,8 +2256,13 @@ async def main_async(args):
 
         # 运行主循环：会阻塞等待 seat0 连接，以及等待人类的控制台输入。
         while 0 not in server.seat_conns:
+          if _RESTART_FULL_EVENT.is_set():
+            return "restart_full"
           await asyncio.sleep(0.1)
-        await server.run_game_loop()
+
+        status = await server.run_game_loop()
+        if status == "restart_full":
+          return "restart_full"
     except asyncio.CancelledError:
       # asyncio.run() 期间 Ctrl+C 会取消挂起的 await；这里安静退出。
       pass
@@ -1616,6 +2273,8 @@ async def main_async(args):
       except Exception:
         pass
 
+  return "stopped"
+
 
 def build_arg_parser() -> argparse.ArgumentParser:
   p = argparse.ArgumentParser(description="Mini danserver (route3): 指定 AI 起手牌 + 终端手动 3 座位")
@@ -1624,8 +2283,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
   # 级牌/段位保持为字符串，兼容 torch 客户端。
   # 根据 UX 约定，curRank 与 AI 手牌在启动时交互输入，因此不强制要求命令行参数。
-
-  p.add_argument("--max-steps", type=int, default=50, help="最多推进多少个出牌动作（避免你不小心打完整局）")
 
   # 默认单终端模式。
   p.add_argument(
@@ -1679,15 +2336,21 @@ def _prompt_ai_hand(cur_rank: str) -> str:
 
 def main():
   try:
-    args = build_arg_parser().parse_args()
-    # 交互输入
-    args.cur_rank = _prompt_cur_rank("2")
-    args.start_pos = _prompt_start_pos(0)
-    args.self_rank = "2"
-    args.oppo_rank = "2"
-    args.ai_hand = _prompt_ai_hand(args.cur_rank)
-    args.spawn_ai = not args.no_spawn_ai
-    asyncio.run(main_async(args))
+    while True:
+      _RESTART_FULL_EVENT.clear()
+      args = build_arg_parser().parse_args()
+      # 交互输入
+      args.cur_rank = _prompt_cur_rank("2")
+      args.start_pos = _prompt_start_pos(0)
+      args.self_rank = "2"
+      args.oppo_rank = "2"
+      args.ai_hand = _prompt_ai_hand(args.cur_rank)
+      args.spawn_ai = not args.no_spawn_ai
+
+      status = asyncio.run(main_async(args))
+      if status == "restart_full":
+        continue
+      break
   except (KeyboardInterrupt, asyncio.CancelledError, EOFError):
     print("已退出。")
     return
