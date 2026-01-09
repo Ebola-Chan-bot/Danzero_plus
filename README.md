@@ -44,3 +44,35 @@ Here we offer a start shell file in the learner directory.
 ## Evaluation
 
 The evaluation code is in the ./wintest directory and we give introduction in the directory.
+
+## Screenshot Card OCR (rank+suit)
+
+If you have game screenshots where each card's corner index (rank+suit) is visible (even if cards overlap), you can use the optional tool in tools/card_corner_ocr.py to output rank+suit for each detected card corner.
+
+Install deps at USER scope (no venv):
+
+```bash
+python -m pip install --user -r requirements-card-ocr.txt
+```
+
+Install the Tesseract binary (Windows):
+
+```powershell
+winget install -e --id UB-Mannheim.TesseractOCR
+```
+
+Optional (if PaddlePaddle works on your system Python):
+
+```bash
+python -m pip install --user -r requirements-card-ocr-paddle.txt
+```
+
+Run on a screenshot:
+
+```bash
+python tools/card_corner_ocr.py --image path/to/screenshot.png --out result.json --debug debug_out
+```
+
+Notes:
+- Default OCR backend is PaddleOCR (open-source). If your screenshot contains both corners, the script keeps only OCR-confident upright corners to avoid double-counting.
+- If PaddleOCR cannot be installed for your system Python, you can install pytesseract + a local Tesseract binary and the script will auto-fallback.
