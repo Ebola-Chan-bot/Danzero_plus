@@ -21,14 +21,18 @@ import glob
 import itertools
 import os
 import random
+import signal
 import subprocess
 import sys
 import tempfile
 import time
 import threading
+import traceback
 from collections import Counter
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+
+import numpy as np
 
 if TYPE_CHECKING:
   from websockets.server import ServerConnection
@@ -51,6 +55,35 @@ Action = List  # [type, key, cards]
 
 # 全量重新开始（从选择级牌/先手/AI 手牌重新走）的跨线程信号。
 _RESTART_FULL_EVENT = threading.Event()
+
+
+def _format_exc(e: BaseException) -> str:
+  return "".join(traceback.format_exception(type(e), e, e.__traceback__))
+
+
+def _exit_cleanly(code: int = 0) -> None:
+  """尽量“干净退出”，避免 Ctrl+C 在解释器退出阶段产生额外报错。
+
+  在 Windows/PowerShell 下，用户经常在程序已经准备退出时再次按 Ctrl+C，
+  这可能会在 Python 线程关闭阶段打印：
+    Exception ignored on threading shutdown: KeyboardInterrupt
+
+  这里在退出前临时忽略 SIGINT，可以避免上述噪声堆栈。
+  """
+
+  try:
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+  except Exception:
+    pass
+  raise SystemExit(int(code))
+
+
+def _log_exception(prefix: str, e: BaseException):
+  try:
+    print(f"{prefix}{type(e).__name__}: {e}")
+    print(_format_exc(e))
+  except Exception:
+    pass
 
 
 def _adviser_card(cur_rank: str) -> Card:
@@ -118,6 +151,7 @@ def format_action_for_human(action: Optional[Action], cur_rank: Optional[str] = 
     "TwoTrips": "钢板",
     "Straight": "顺子",
     "StraightFlush": "同花顺",
+    "JokerBomb": "王炸",
     "Bomb": "炸弹",
   }.get(action[0], action[0])
 
@@ -198,46 +232,52 @@ class _ScreenRoiSelector:
 
     top = tk.Toplevel(parent)
     self.top = top
-    top.title(title)
+    # 需求：不要标题栏，覆盖全屏显示。
+    try:
+      top.overrideredirect(True)
+    except Exception:
+      pass
+    try:
+      top.attributes("-fullscreen", True)
+    except Exception:
+      pass
     top.attributes("-topmost", True)
     top.configure(bg="black")
 
     sw = int(top.winfo_screenwidth())
     sh = int(top.winfo_screenheight())
     iw, ih = self._img.size
-    scale = min(sw / max(1, iw), sh / max(1, ih), 1.0)
+    # 全屏显示：允许放大/缩小到屏幕内（等比）。
+    scale = min(sw / max(1, iw), sh / max(1, ih))
     self._scale = float(scale)
 
-    if scale < 1.0:
-      disp = self._img.resize((int(iw * scale), int(ih * scale)))
+    disp_w = max(1, int(round(iw * scale)))
+    disp_h = max(1, int(round(ih * scale)))
+    if disp_w != iw or disp_h != ih:
+      disp = self._img.resize((disp_w, disp_h))
     else:
       disp = self._img
 
     from PIL import ImageTk
 
     self._photo = ImageTk.PhotoImage(disp)
-    cw = self._photo.width()
-    ch = self._photo.height()
+    cw = int(self._photo.width())
+    ch = int(self._photo.height())
 
-    canvas = tk.Canvas(top, width=cw, height=ch, highlightthickness=0)
+    # 图像居中铺满全屏画布。
+    self._x_off = max(0, (sw - cw) // 2)
+    self._y_off = max(0, (sh - ch) // 2)
+
+    canvas = tk.Canvas(top, width=sw, height=sh, highlightthickness=0, bg="black")
     self.canvas = canvas
-    canvas.pack()
-    canvas.create_image(0, 0, image=self._photo, anchor="nw")
+    canvas.pack(fill="both", expand=True)
+    canvas.create_image(self._x_off, self._y_off, image=self._photo, anchor="nw")
 
     canvas.bind("<Button-1>", self._on_down)
     canvas.bind("<B1-Motion>", self._on_move)
     canvas.bind("<ButtonRelease-1>", self._on_up)
     top.bind("<Escape>", self._on_cancel)
     top.protocol("WM_DELETE_WINDOW", self._on_cancel)
-
-    # 居中显示
-    try:
-      top.update_idletasks()
-      x = max(0, (sw - cw) // 2)
-      y = max(0, (sh - ch) // 2)
-      top.geometry(f"{cw}x{ch}+{x}+{y}")
-    except Exception:
-      pass
 
     top.grab_set()
 
@@ -263,6 +303,26 @@ class _ScreenRoiSelector:
     x1, y1 = int(ev.x), int(ev.y)
     x_min, x_max = (x0, x1) if x0 <= x1 else (x1, x0)
     y_min, y_max = (y0, y1) if y0 <= y1 else (y1, y0)
+
+    # 扣掉居中偏移，得到显示图上的坐标。
+    try:
+      x_min -= int(getattr(self, "_x_off", 0))
+      x_max -= int(getattr(self, "_x_off", 0))
+      y_min -= int(getattr(self, "_y_off", 0))
+      y_max -= int(getattr(self, "_y_off", 0))
+    except Exception:
+      pass
+
+    # clamp 到图像范围
+    try:
+      cw = int(self._photo.width())
+      ch = int(self._photo.height())
+      x_min = max(0, min(cw, x_min))
+      x_max = max(0, min(cw, x_max))
+      y_min = max(0, min(ch, y_min))
+      y_max = max(0, min(ch, y_max))
+    except Exception:
+      pass
 
     # 转回原图坐标
     if self._scale > 0:
@@ -443,9 +503,11 @@ class _PersistentHumanActionPicker:
     self.suit_fg = {"C": "black", "S": "black", "D": "red", "H": "red"}
     self.rank_display = {"T": "10"}
 
-    rank_desc = ["A", "K", "Q", "J", "T", "9", "8", "7", "6", "5", "4", "3", "2"]
+    # 点数列顺序：把当前级牌放在第一列，其余按 A..2 排列。
+    # 注意：窗口需要跨局复用，因此“级牌变化”时要支持在原窗口内刷新列顺序。
+    self._rank_desc = ["A", "K", "Q", "J", "T", "9", "8", "7", "6", "5", "4", "3", "2"]
     self.cur_rank = cur_rank
-    self.rank_chars = [cur_rank] + [r for r in rank_desc if r != cur_rank]
+    self.rank_chars = [cur_rank] + [r for r in self._rank_desc if r != cur_rank]
     # 花色顺序要求：从下到上是 ♦ ♣ ♥ ♠，因此从上到下是 ♠ ♥ ♣ ♦。
     self.suit_rows = ["S", "H", "C", "D"]  # 从上到下
 
@@ -494,12 +556,15 @@ class _PersistentHumanActionPicker:
     preview_frame.pack(fill="both", anchor="w")
     self.preview_frame = preview_frame
     self.preview_cells: Dict[str, tk.Label] = {}
+    self._preview_rank_headers: Dict[str, tk.Label] = {}
 
     tk.Label(preview_frame, text="").grid(row=0, column=0, padx=3, pady=1)
     tk.Label(preview_frame, text="大JOKER", fg="red").grid(row=0, column=1, padx=3, pady=1)
     tk.Label(preview_frame, text="小JOKER", fg="black").grid(row=0, column=2, padx=3, pady=1)
     for col, r in enumerate(self.rank_chars, start=3):
-      tk.Label(preview_frame, text=self.rank_display.get(r, r)).grid(row=0, column=col, padx=3, pady=1)
+      lbl = tk.Label(preview_frame, text=self.rank_display.get(r, r))
+      lbl.grid(row=0, column=col, padx=3, pady=1)
+      self._preview_rank_headers[r] = lbl
 
     for row, s in enumerate(self.suit_rows, start=1):
       tk.Label(preview_frame, text=self.suit_symbol[s], fg=self.suit_fg[s]).grid(
@@ -531,10 +596,13 @@ class _PersistentHumanActionPicker:
     frame = tk.Frame(root)
     frame.pack(padx=8, pady=8, fill="both", expand=True)
     self.buttons: Dict[str, tk.Button] = {}
+    self._grid_rank_headers: Dict[str, tk.Label] = {}
 
     tk.Label(frame, text="").grid(row=0, column=0, padx=4, pady=2)
     for col, r in enumerate(self.rank_chars, start=1):
-      tk.Label(frame, text=self.rank_display.get(r, r)).grid(row=0, column=col, padx=4, pady=2)
+      lbl = tk.Label(frame, text=self.rank_display.get(r, r))
+      lbl.grid(row=0, column=col, padx=4, pady=2)
+      self._grid_rank_headers[r] = lbl
 
     for row, s in enumerate(self.suit_rows, start=1):
       tk.Label(frame, text=self.suit_symbol[s], fg=self.suit_fg[s]).grid(row=row, column=0, padx=4, pady=2)
@@ -581,12 +649,64 @@ class _PersistentHumanActionPicker:
     self.pass_btn = tk.Button(action_bar, text="PASS", command=self._on_pass)
     self.pass_btn.pack(side="left", padx=(8, 0))
     self.confirm_btn = tk.Button(action_bar, text="确认", command=self._on_confirm)
-    self.confirm_btn.pack(side="right")
+    self.confirm_btn.pack(side="left", padx=(8, 0))
 
     self._done_var = tk.IntVar(value=0)
     root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     # 默认显示并就绪。
+    self._refresh_ui()
+
+  def set_cur_rank(self, cur_rank: str) -> None:
+    """在不销毁窗口的情况下更新级牌。
+
+    目标：窗口跨局复用时不重开（避免窗口位置跑掉），但列顺序/参谋规则等仍以新级牌为准。
+    """
+
+    cr = str(cur_rank or "").strip().upper()
+    if not cr or cr == str(getattr(self, "cur_rank", "")):
+      return
+
+    self.cur_rank = cr
+    self.rank_chars = [cr] + [r for r in self._rank_desc if r != cr]
+
+    # 重新排列“点数列”的 grid 位置（标题行 + 各花色行），避免销毁 root。
+    for idx, r in enumerate(self.rank_chars):
+      preview_col = int(idx) + 3  # 预览区：前 3 列留给空白/大王/小王
+      grid_col = int(idx) + 1     # 按钮区：第 0 列是花色标签
+
+      try:
+        lblp = self._preview_rank_headers.get(r)
+        if lblp is not None:
+          lblp.configure(text=self.rank_display.get(r, r))
+          lblp.grid_configure(column=preview_col)
+      except Exception:
+        pass
+
+      try:
+        lblg = self._grid_rank_headers.get(r)
+        if lblg is not None:
+          lblg.configure(text=self.rank_display.get(r, r))
+          lblg.grid_configure(column=grid_col)
+      except Exception:
+        pass
+
+      for s in self.suit_rows:
+        code = f"{s}{r}"
+        try:
+          pl = self.preview_cells.get(code)
+          if pl is not None:
+            pl.grid_configure(column=preview_col)
+        except Exception:
+          pass
+        try:
+          btn = self.buttons.get(code)
+          if btn is not None:
+            btn.grid_configure(column=grid_col)
+        except Exception:
+          pass
+
+    # 刷新上下文提示/颜色/数量等。
     self._refresh_ui()
 
   def _card_color(self, card: str) -> str:
@@ -626,7 +746,7 @@ class _PersistentHumanActionPicker:
 
     if self._mode == "ai_hand":
       self.info_var.set(f"已选 {len(self.selected)}/27")
-      self.context_var.set("关闭窗口=随机；确认后窗口会保留（等待手动出牌）")
+      self.context_var.set("关闭窗口=终端输入（回车=随机）；确认后窗口会保留（等待手动出牌）")
     elif self._mode == "human":
       self.info_var.set(f"已选 {len(self.selected)}（最多 {self.remaining}）")
       if self.greater_action is None:
@@ -935,11 +1055,9 @@ class _PersistentHumanActionPicker:
 
   def _on_close(self):
     # 用户关闭窗口：
-    # - AI 手牌模式：视为随机（返回空字符串），但保留窗口实例供后续复用。
+    # - AI 手牌模式：本回合回退到终端输入（终端回车仍可随机），但保留窗口实例供后续复用。
     # - 人类出牌模式：本回合回退到终端输入；下次需要输入时再把窗口显示出来。
     self._closed_for_turn = True
-    if self._mode == "ai_hand":
-      self._result_ai_hand = ""
     # 只隐藏不销毁，便于后续再次打开。
     try:
       self.root.withdraw()
@@ -1023,10 +1141,10 @@ class _PersistentHumanActionPicker:
       pass
     self.root.wait_variable(self._done_var)
 
-    # 如果用户关闭窗口：视为随机
+    # 如果用户关闭窗口：回退到终端输入（终端回车仍可随机）
     if self._closed_for_turn:
       self._idle()
-      return ""
+      raise _GuiFallbackToTerminalThisTurn()
 
     v = (self._result_ai_hand or "").strip()
     self._idle()
@@ -1050,6 +1168,12 @@ def _pick_human_action_gui(
   # 只创建一次，整个会话复用同一个窗口。
   if _HUMAN_PICKER is None:
     _HUMAN_PICKER = _PersistentHumanActionPicker(cur_rank=cur_rank)
+  else:
+    try:
+      # “重新开局”后可能会更换级牌；这里在不销毁窗口的情况下刷新列顺序/参谋规则。
+      _HUMAN_PICKER.set_cur_rank(cur_rank)
+    except Exception:
+      pass
 
   return _HUMAN_PICKER.pick_action(
     seat=seat,
@@ -1196,6 +1320,14 @@ def _resolve_action_with_adviser(
   if not adv_idx:
     return classify_action(cards, cur_rank)
 
+  # 规则：参谋单出/对子时按普通级牌处理，不考虑补牌。
+  try:
+    base = classify_action(cards, cur_rank)
+    if base and base[0] in {"Single", "Pair"}:
+      return base
+  except Exception:
+    pass
+
   # 枚举参谋->任意非 Joker 牌 的替代（点数+花色均可变）。
   options: List[Action] = []
   seen = set()
@@ -1209,8 +1341,13 @@ def _resolve_action_with_adviser(
     except Exception:
       continue
 
-    # 用虚拟牌面去重：同一声明动作 + 同一虚拟牌面视为同一种补法
-    sig = (act_v[0], act_v[1], tuple(sorted(virtual)))
+    # 去重：
+    # - 对大多数牌型，忽略“仅花色不同”的无意义歧义（如四炸补哪个花色都一样）。
+    # - 但对同花顺 StraightFlush，花色是牌型成立/显示的一部分，必须保留。
+    if act_v[0] == "StraightFlush":
+      sig = (act_v[0], act_v[1], tuple(sorted(virtual)))
+    else:
+      sig = (act_v[0], act_v[1], tuple(sorted([c[-1] for c in virtual])))
     if sig in seen:
       continue
     seen.add(sig)
@@ -1219,9 +1356,14 @@ def _resolve_action_with_adviser(
     # 记录参谋补法（记录参谋变成的牌面，含花色）
     detail: Dict[str, Any] = {}
     # 参谋按本身牌面（H+cur_rank）不额外标注；只有发生替换时才标注。
-    adv_as_cards = [c for c in cards_as if str(c) != adviser]
+    adv_as_cards = [str(c) for c in cards_as if str(c) != adviser]
     if adv_as_cards:
-      detail["adviser_as"] = list(adv_as_cards)
+      # 大多数牌型花色不影响比较；为了减少噪声默认只记录点数。
+      # 但同花顺需要明确花色，因此保留完整牌面。
+      if act_v[0] == "StraightFlush":
+        detail["adviser_as"] = list(adv_as_cards)
+      else:
+        detail["adviser_as"] = [c[-1] if isinstance(c, str) and len(c) >= 2 else str(c) for c in adv_as_cards]
     detail["virtual_ranks"] = [c[-1] for c in virtual]
     detail["virtual_cards"] = list(virtual)
     if detail:
@@ -1238,6 +1380,17 @@ def _resolve_action_with_adviser(
       options = beatable
     else:
       raise ValueError("这手牌无论参谋怎么当，都压不过当前牌（需要更大的同类牌型或炸弹/同花顺）。")
+
+  # 规则补充：参谋补法存在“炸弹解释”时，不允许选择非炸弹解释。
+  # 例如：三带一对参谋（可解释为五炸）一律按五炸处理。
+  def _is_bomb_like(a: Action) -> bool:
+    try:
+      return a[0] in {"Bomb", "StraightFlush", "JokerBomb"}
+    except Exception:
+      return False
+
+  if any(_is_bomb_like(a) for a in options):
+    options = [a for a in options if _is_bomb_like(a)]
 
   if len(options) == 1 or not allow_interactive:
     return options[0]
@@ -1321,6 +1474,63 @@ def parse_cards_csv(s: str) -> List[Card]:
   return [x.strip() for x in raw if x.strip()]
 
 
+def parse_ai_hand_text(s: str) -> List[Card]:
+  """Parse AI hand input from terminal.
+
+  支持两种输入风格：
+  1) 内部编码：H2 D4 C10 / HT / HR / SB ...
+  2) 人类展示：♥2 ♣A×2 小JOKER×2 大JOKER ♦10 ...
+
+  说明：
+  - 乘号支持中文 '×'（如 ♣A×2）
+  - 10 会映射为 T
+  - 'JOKER'（不区分大小）将按库存先用 HR 再用 SB
+  """
+  if not s:
+    return []
+
+  tokens = [t for t in s.replace(",", " ").split() if t.strip()]
+  out: List[Card] = []
+
+  def _split_mul(tok: str) -> Tuple[str, int]:
+    tok = tok.strip()
+    if not tok:
+      return ("", 1)
+    if "×" in tok:
+      base, n = tok.split("×", 1)
+      base = base.strip()
+      try:
+        mul = int(n.strip())
+      except Exception:
+        mul = 1
+      return (base, max(1, mul))
+    return (tok, 1)
+
+  for tok in tokens:
+    base, mul = _split_mul(tok)
+    if not base:
+      continue
+
+    up = base.strip().upper()
+    if up == "JOKER":
+      # 不区分大小王时，按两副牌库存依次填充 HR/SB。
+      for _ in range(mul):
+        if out.count("HR") < 2:
+          out.append("HR")
+        elif out.count("SB") < 2:
+          out.append("SB")
+        else:
+          raise ValueError("JOKER 数量超出两副牌库存（HR/SB 各最多 2）。")
+      continue
+
+    c = _parse_human_token_to_card(base)
+    if not c:
+      raise ValueError(f"无法识别牌面: {tok}")
+    out.extend([c] * mul)
+
+  return out
+
+
 def remove_multiset(deck: List[Card], cards: List[Card]) -> None:
   deck_counter = Counter(deck)
   need = Counter(cards)
@@ -1352,6 +1562,12 @@ def classify_action(cards: List[Card], cur_rank: str) -> Action:
   # 返回 [type, key, cards]
   if not cards:
     return ["PASS", "PASS", []]
+
+  # 王炸：两副牌下 2 大王(HR) + 2 小王(SB)。
+  if len(cards) == 4:
+    cnt_cards = Counter(cards)
+    if int(cnt_cards.get("HR", 0)) == 2 and int(cnt_cards.get("SB", 0)) == 2:
+      return ["JokerBomb", "JOKER", cards]
 
   ranks = [c[-1] for c in cards]
   counts = Counter(ranks)
@@ -1439,7 +1655,7 @@ def beats(action: Action, greater_action: Optional[Action], cur_rank: str) -> bo
 
   def _is_bomb_like(a: Action) -> bool:
     try:
-      return a[0] in {"Bomb", "StraightFlush"}
+      return a[0] in {"Bomb", "StraightFlush", "JokerBomb"}
     except Exception:
       return False
 
@@ -1447,6 +1663,9 @@ def beats(action: Action, greater_action: Optional[Action], cur_rank: str) -> bo
     # 同花顺视为“5.5 炸”：大于五炸，小于六炸。
     t = a[0]
     ln = len(a[2]) if isinstance(a, list) and len(a) >= 3 else 0
+    if t == "JokerBomb":
+      # 最高炸弹：不可被任何牌型压过。
+      return (10_000, 10_000)
     if t == "StraightFlush":
       size_rank = 55
       key, _ = _action_key_from_action(a, cur_rank)
@@ -1501,6 +1720,10 @@ def generate_actions_from_hand(hand: List[Card], cur_rank: str) -> List[Action]:
     if detail:
       a.append(detail)
     out.append(a)
+
+  # 王炸（两大王+两小王）：两副牌下的最大炸弹。
+  if hand.count("HR") >= 2 and hand.count("SB") >= 2:
+    push("JokerBomb", "JOKER", ["HR", "HR", "SB", "SB"], None)
 
   # 单张：去重即可（两副牌同牌面视为等价选择）
   for c in sorted(set(hand)):
@@ -1809,6 +2032,32 @@ def generate_actions_from_hand(hand: List[Card], cur_rank: str) -> List[Action]:
         detail = None
       push("TwoTrips", "A", list(cards), detail)
 
+  # 规则补充：若同一组“实体牌”(含参谋)存在炸弹类解释，则不允许非炸弹类解释。
+  # 例如：三带一对参谋（可解释为五炸）一律不产出 ThreeWithTwo，只保留 Bomb。
+  def _is_bomb_like(a: Action) -> bool:
+    try:
+      return a[0] in {"Bomb", "StraightFlush", "JokerBomb"}
+    except Exception:
+      return False
+
+  group_has_bomb: Dict[Tuple[Card, ...], bool] = {}
+  for a in out:
+    try:
+      sig = tuple(sorted(a[2]))
+    except Exception:
+      continue
+    if _is_bomb_like(a):
+      group_has_bomb[sig] = True
+    else:
+      group_has_bomb.setdefault(sig, False)
+
+  if group_has_bomb:
+    out = [
+      a
+      for a in out
+      if (not group_has_bomb.get(tuple(sorted(a[2])), False)) or _is_bomb_like(a)
+    ]
+
   # 稳定排序（用声明动作的 key/长度）
   def sort_key(a: Action) -> Tuple[int, int, int, str]:
     t = a[0]
@@ -1820,7 +2069,9 @@ def generate_actions_from_hand(hand: List[Card], cur_rank: str) -> List[Action]:
       "ThreePair": 5,
       "TwoTrips": 6,
       "Straight": 7,
+      "StraightFlush": 8,
       "Bomb": 8,
+      "JokerBomb": 9,
     }.get(t, 99)
     k, ln = _action_key_from_action(a, cur_rank)
     return (type_order, ln, k, str(a[1]))
@@ -1848,7 +2099,9 @@ class MiniDanServer:
     self.cur_rank = cur_rank
     self.self_rank = self_rank
     self.oppo_rank = oppo_rank
-    self.ai_hand = ai_hand[:]  # 座位 seat0
+    self.ai_hand = ai_hand[:]  # seat0
+    # 需要保留“AI 起手牌”，用于局末通过牌库扣除推断未出完者手牌。
+    self.ai_hand_initial = ai_hand[:]
 
     self.seat_conns: Dict[int, SeatConn] = {}
 
@@ -1856,27 +2109,87 @@ class MiniDanServer:
     self.played_cards = Counter()  # Card -> 已出过数量
     self.human_remaining = {1: 27, 2: 27, 3: 27}
 
+    # 记录全局出牌序列（含 PASS）与每个座位实际出过的牌。
+    # 用途：对局结束后，对“已出完牌的人类玩家”可用其整局出牌恢复起手牌并离线回放生成训练轨迹。
+    self.play_history: List[Tuple[int, Action]] = []
+    self.played_by_seat: Dict[int, List[Card]] = {0: [], 1: [], 2: [], 3: []}
+
     self.current_pos = int(start_pos)
     self.greater_action: Optional[Action] = None
     self.greater_pos: Optional[int] = None
     self.passes_since_play = 0
 
+    # 记录最后一次发给 seat0 的 act 请求摘要，便于排查异常原因（不打印整包 actionList）。
+    self._last_seat0_act_meta: Optional[Dict[str, Any]] = None
+
+    # 可选：本进程内 torch 推理（不走 ws/ZMQ/子进程）。
+    # 需求：不做超时；推理异常直接抛出让主进程崩掉。
+    self.seat0_inproc_agent = None
+
+    # inproc 训练用：记录本局结束原因。
+    self.end_reason: Optional[str] = None
+
+    # 记录出完顺序（只记录到停局为止）。seat0=AI，seat2=队友，seat1/3=敌人。
+    self.finish_order: List[int] = []
+    self._finished: set[int] = set()
+
+  def _mark_finished(self, seat: int):
+    s = int(seat)
+    if s in self._finished:
+      return
+    self._finished.add(s)
+    self.finish_order.append(s)
+
   async def register(self, seat: int, ws: ServerConnection):
     self.seat_conns[seat] = SeatConn(seat=seat, ws=ws)
+
+  def _drop_seat(self, seat: int):
+    try:
+      self.seat_conns.pop(seat, None)
+    except Exception:
+      pass
 
   async def broadcast(self, payload: dict):
     if not self.seat_conns:
       return
     msg = __import__("json").dumps(payload)
-    await asyncio.gather(*[c.ws.send(msg) for c in self.seat_conns.values()])
+
+    # 某个连接断开时，不应导致整个服务端崩溃。
+    items = list(self.seat_conns.items())
+    results = await asyncio.gather(*[c.ws.send(msg) for _, c in items], return_exceptions=True)
+    for (seat, _c), r in zip(items, results):
+      if isinstance(r, Exception):
+        self._drop_seat(seat)
 
   async def send_to(self, seat: int, payload: dict):
     msg = __import__("json").dumps(payload)
-    await self.seat_conns[seat].ws.send(msg)
+    try:
+      await self.seat_conns[seat].ws.send(msg)
+    except Exception as e:
+      if seat == 0:
+        try:
+          if self._last_seat0_act_meta:
+            print(f"[server] last seat0 act meta: {self._last_seat0_act_meta}")
+        except Exception:
+          pass
+        _log_exception("[server] send_to(seat0) failed: ", e)
+      self._drop_seat(seat)
+      raise
 
   async def recv_from(self, seat: int) -> dict:
-    raw = await self.seat_conns[seat].ws.recv()
-    return __import__("json").loads(raw)
+    try:
+      raw = await self.seat_conns[seat].ws.recv()
+      return __import__("json").loads(raw)
+    except Exception as e:
+      if seat == 0:
+        try:
+          if self._last_seat0_act_meta:
+            print(f"[server] last seat0 act meta: {self._last_seat0_act_meta}")
+        except Exception:
+          pass
+        _log_exception("[server] recv_from(seat0) failed: ", e)
+      self._drop_seat(seat)
+      raise
 
   async def send_beginning(self, seat: int):
     await self.send_to(
@@ -1897,12 +2210,18 @@ class MiniDanServer:
   def reset_for_new_game(self, *, ai_hand: List[Card], start_pos: int):
     # 重置对局状态（保留连接）。
     self.ai_hand = ai_hand[:]
+    self.ai_hand_initial = ai_hand[:]
     self.played_cards = Counter()
     self.human_remaining = {1: 27, 2: 27, 3: 27}
+    self.play_history = []
+    self.played_by_seat = {0: [], 1: [], 2: [], 3: []}
     self.current_pos = int(start_pos)
     self.greater_action = None
     self.greater_pos = None
     self.passes_since_play = 0
+    self.end_reason = None
+    self.finish_order = []
+    self._finished = set()
 
   def prompt_human_action(self, seat: int) -> Action:
     # 优先使用 GUI 选牌。
@@ -1948,29 +2267,49 @@ class MiniDanServer:
 
       raw_tokens = s.replace(",", " ").split()
 
+      def _split_mul(tok: str) -> Tuple[str, int]:
+        tok = tok.strip()
+        if not tok:
+          return ("", 1)
+        if "×" in tok:
+          base, n = tok.split("×", 1)
+          base = base.strip()
+          try:
+            mul = int(n.strip())
+          except Exception:
+            mul = 1
+          return (base, max(1, mul))
+        return (tok, 1)
+
       # 将人类友好输入解析为内部编码。
       ai_counter = Counter(self.ai_hand)
       parsed_cards: List[Card] = []
       parse_error = None
       for tok in raw_tokens:
-        up = tok.strip().upper()
+        base, mul = _split_mul(tok)
+        if not base:
+          continue
+        up = base.strip().upper()
         if up == "JOKER":
           # 确定性地选择一个可用的王：优先 HR，其次 SB。
-          for cand in ("HR", "SB"):
-            available = 2 - self.played_cards.get(cand, 0) - ai_counter.get(cand, 0)
-            if available > 0:
-              parsed_cards.append(cand)
+          for _ in range(mul):
+            for cand in ("HR", "SB"):
+              available = 2 - self.played_cards.get(cand, 0) - ai_counter.get(cand, 0)
+              if available > 0:
+                parsed_cards.append(cand)
+                break
+            else:
+              parse_error = "JOKER 已不可用（与 AI 手牌冲突/已出过/超出两副牌库存）"
               break
-          else:
-            parse_error = "JOKER 已不可用（与 AI 手牌冲突/已出过/超出两副牌库存）"
+          if parse_error:
             break
           continue
 
-        c = _parse_human_token_to_card(tok)
+        c = _parse_human_token_to_card(base)
         if not c:
-          parse_error = f"无法识别牌面: {tok}（支持如 ♥3 ♦10 ♣A JOKER）"
+          parse_error = f"无法识别牌面: {tok}（支持如 ♥3 ♦10 ♣A JOKER、以及 ♦6×2）"
           break
-        parsed_cards.append(c)
+        parsed_cards.extend([c] * int(mul))
 
       if parse_error:
         print(parse_error)
@@ -2014,12 +2353,46 @@ class MiniDanServer:
       return act
 
   async def run_game_loop(self) -> str:
-    # 当前实现：只要求 seat0 连接即可开局。
-    if 0 not in self.seat_conns:
-      raise RuntimeError("需要 seat0 连接到 /game/client0")
+    # 默认模式：要求 seat0 websocket 连接后开局。
+    # inproc torch 模式：不需要任何连接。
+    if self.seat0_inproc_agent is None:
+      if 0 not in self.seat_conns:
+        raise RuntimeError("需要 seat0 连接到 /game/client0")
+      # seat0（torch/ai2 客户端）在某些情况下可能卡死不回包。
+      # 需求：AI 一旦出问题应立即结束游戏，因此默认“失败即停”（首个超时就停止）。
+      # 可通过环境变量覆盖：DAN_AI_RESPONSE_TIMEOUT（秒）、DAN_AI_MAX_TIMEOUTS（连续次数）。
+      try:
+        ai_timeout_s = float(os.getenv("DAN_AI_RESPONSE_TIMEOUT", "3"))
+      except Exception:
+        ai_timeout_s = 3.0
+      try:
+        ai_max_timeouts = int(os.getenv("DAN_AI_MAX_TIMEOUTS", "1"))
+      except Exception:
+        ai_max_timeouts = 1
+      ai_consecutive_timeouts = 0
 
-    # 连接后发送 beginning。
-    await self.send_beginning(0)
+      # 连接后发送 beginning。
+      await self.send_beginning(0)
+    else:
+      # inproc：不使用超时变量。
+      ai_timeout_s = None  # type: ignore
+      ai_max_timeouts = None  # type: ignore
+      ai_consecutive_timeouts = None  # type: ignore
+
+    def _seat_active(pos: int) -> bool:
+      if pos == 0:
+        return len(self.ai_hand) > 0
+      return int(self.human_remaining.get(pos, 27)) > 0
+
+    def _active_seats() -> List[int]:
+      return [p for p in range(4) if _seat_active(p)]
+
+    def _next_active_after(pos: int) -> int:
+      for step in range(1, 5):
+        cand = (pos + step) % 4
+        if _seat_active(cand):
+          return cand
+      return pos
 
     stopped_early = False
     while True:
@@ -2027,12 +2400,22 @@ class MiniDanServer:
       if _RESTART_FULL_EVENT.is_set():
         return "restart_full"
 
+      # 已出完的玩家不再参与出牌回合。
+      active = _active_seats()
+      if active:
+        while not _seat_active(self.current_pos):
+          self.current_pos = _next_active_after(self.current_pos)
+
       greater_pos_payload = self.greater_pos if self.greater_pos is not None else -1
       greater_action_payload = self.greater_action if self.greater_action is not None else ["PASS", "PASS", []]
 
       if self.current_pos == 0:
-        # AI 回合
+        # AI 回合（仅 seat0）
+        t0 = time.time()
         all_actions = generate_actions_from_hand(self.ai_hand, self.cur_rank)
+        gen_ms = (time.time() - t0) * 1000.0
+        if gen_ms >= 1500:
+          print(f"[server] generate_actions_from_hand took {gen_ms:.0f}ms (hand={len(self.ai_hand)})")
 
         if self.greater_action is None:
           action_list = all_actions
@@ -2060,12 +2443,60 @@ class MiniDanServer:
           "greaterAction": greater_action_payload,
         }
 
-        await self.send_to(0, msg)
-        resp = await self.recv_from(0)
-        act_index = int(resp.get("actIndex", 0))
-        if act_index < 0 or act_index >= len(action_list):
-          act_index = 0
-        act = action_list[act_index]
+        try:
+          self._last_seat0_act_meta = {
+            "stage": "play",
+            "curPos": int(self.current_pos),
+            "curRank": str(self.cur_rank),
+            "hand": int(len(self.ai_hand)),
+            "numActions": int(len(action_list)),
+            "hasGreater": bool(self.greater_action is not None),
+            "greaterPos": int(greater_pos_payload),
+          }
+        except Exception:
+          self._last_seat0_act_meta = None
+
+        if self.seat0_inproc_agent is not None:
+          # 需求：不做超时；推理出任何错误就让主线程/进程崩掉。
+          act_index = int(self.seat0_inproc_agent.act_play(msg))
+          if act_index < 0 or act_index >= len(action_list):
+            act_index = 0
+          act = action_list[act_index]
+        else:
+          resp = None
+          try:
+            await asyncio.wait_for(self.send_to(0, msg), timeout=ai_timeout_s)
+            resp = await asyncio.wait_for(self.recv_from(0), timeout=ai_timeout_s)
+            ai_consecutive_timeouts = 0
+
+            act_index = int((resp or {}).get("actIndex", 0))
+            if act_index < 0 or act_index >= len(action_list):
+              act_index = 0
+            act = action_list[act_index]
+          except asyncio.TimeoutError:
+            ai_consecutive_timeouts += 1
+            print(
+              f"[server] seat0 timeout waiting for actIndex ({ai_timeout_s}s). "
+              f"consecutive={ai_consecutive_timeouts}/{ai_max_timeouts}."
+            )
+
+            try:
+              if self._last_seat0_act_meta:
+                print(f"[server] last seat0 act meta: {self._last_seat0_act_meta}")
+            except Exception:
+              pass
+
+            # 需求：AI 出问题立即停局。
+            if ai_consecutive_timeouts >= ai_max_timeouts:
+              print("[server] seat0 timed out; stopping game loop (fail-fast).")
+              return "stopped"
+
+            # 理论上不会走到这里（默认 max_timeouts=1），保底。
+            return "stopped"
+          except Exception as e:
+            # seat0 断开（例如 keepalive 超时/客户端退出）时，优雅结束。
+            _log_exception("[server] seat0 connection error; stopping (fail-fast): ", e)
+            return "stopped"
 
         # 扣除 AI 手牌（移除已出的牌）
         if act[0] != "PASS":
@@ -2076,6 +2507,17 @@ class MiniDanServer:
               # 如有不一致则忽略；这里是实验服。
               pass
           self.played_cards.update(act[2])
+
+        # 记录出牌历史（用于局末离线回放）
+        try:
+          self.play_history.append((int(self.current_pos), act))
+          if act[0] != "PASS":
+            self.played_by_seat[0].extend(list(act[2]))
+        except Exception:
+          pass
+
+        if not self.ai_hand:
+          self._mark_finished(0)
 
       else:
         # 人类回合（服务器控制台输入）
@@ -2094,6 +2536,17 @@ class MiniDanServer:
           )
           self.played_cards.update(act[2])
 
+        if int(self.human_remaining.get(self.current_pos, 27)) <= 0:
+          self._mark_finished(self.current_pos)
+
+        # 记录出牌历史（用于局末离线回放）
+        try:
+          self.play_history.append((int(self.current_pos), act))
+          if act[0] != "PASS":
+            self.played_by_seat[int(self.current_pos)].extend(list(act[2]))
+        except Exception:
+          pass
+
       # 计算本轮新状态（ai2 的 notify 需要 greaterPos/greaterAction）
       if act[0] == "PASS":
         new_greater_action = self.greater_action
@@ -2104,34 +2557,67 @@ class MiniDanServer:
         new_greater_pos = self.current_pos
         new_passes = 0
 
+      # 服务端打印（不依赖客户端输出），避免 seat0 超时/无日志时看不到动作。
+      try:
+        cur_s = "过" if act[0] == "PASS" else format_action_for_human(act, self.cur_rank)
+        gp = int(new_greater_pos) if new_greater_pos is not None else -1
+        ga = new_greater_action
+        greater_s = format_action_for_human(ga, self.cur_rank) if ga is not None else "无"
+        if gp == int(self.current_pos) and ga == act and act[0] != "PASS":
+          print(f"{self.current_pos}号位打出{cur_s}（当前最大）")
+        else:
+          if gp >= 0 and ga is not None:
+            print(f"{self.current_pos}号位打出{cur_s}，当前最大 {gp}号位 {greater_s}")
+          else:
+            print(f"{self.current_pos}号位打出{cur_s}")
+      except Exception:
+        pass
+
       # 广播 notify(play)
-      await self.broadcast(
-        {
-          "type": "notify",
-          "stage": "play",
-          "curPos": self.current_pos,
-          "curAction": act,
-          "greaterPos": new_greater_pos if new_greater_pos is not None else -1,
-          "greaterAction": new_greater_action if new_greater_action is not None else ["PASS", "PASS", []],
-        }
-      )
+      notify_play = {
+        "type": "notify",
+        "stage": "play",
+        "curPos": self.current_pos,
+        "curAction": act,
+        "greaterPos": new_greater_pos if new_greater_pos is not None else -1,
+        "greaterAction": new_greater_action if new_greater_action is not None else ["PASS", "PASS", []],
+      }
+
+      if self.seat0_inproc_agent is not None:
+        self.seat0_inproc_agent.on_notify_play(self.current_pos, act)
+
+      await self.broadcast(notify_play)
 
       # 提交本轮状态
       self.greater_action = new_greater_action
       self.greater_pos = new_greater_pos
       self.passes_since_play = new_passes
 
-      # 自上一次有人出牌后，连续 3 个 PASS 则该墩结束
-      if self.greater_action is not None and self.passes_since_play >= 3:
-        self.current_pos = int(self.greater_pos)
+      # 自上一次有人出牌后，所有“仍在场(active)”的其他玩家都 PASS，则该墩结束。
+      active_after = _active_seats()
+      leader_active = False
+      try:
+        if self.greater_pos is not None:
+          leader_active = _seat_active(int(self.greater_pos))
+      except Exception:
+        leader_active = False
+      required_passes = max(0, len(active_after) - (1 if leader_active else 0))
+      if self.greater_action is not None and self.passes_since_play >= required_passes:
+        lead = int(self.greater_pos) if self.greater_pos is not None else int(self.current_pos)
+        if _seat_active(lead):
+          self.current_pos = lead
+        else:
+          teammate = (lead + 2) % 4
+          self.current_pos = teammate if _seat_active(teammate) else _next_active_after(lead)
         self.greater_action = None
         self.greater_pos = None
         self.passes_since_play = 0
       else:
-        self.current_pos = (self.current_pos + 1) % 4
+        self.current_pos = _next_active_after(self.current_pos)
 
       if not self.ai_hand:
         print("AI 已出完牌（实验服将停止）。")
+        self.end_reason = "ai_out"
         stopped_early = True
         break
 
@@ -2140,6 +2626,12 @@ class MiniDanServer:
       # - AI 没出完，但敌方已出完（seat1 和 seat3 都出完）
       if int(self.human_remaining.get(1, 27)) <= 0 and int(self.human_remaining.get(3, 27)) <= 0:
         print("敌方（Seat1/Seat3）已出完牌（实验服将停止）。")
+        # 如果敌方出完牌导致停局，补记他们的完成顺序（若尚未记录）。
+        if int(self.human_remaining.get(1, 27)) <= 0:
+          self._mark_finished(1)
+        if int(self.human_remaining.get(3, 27)) <= 0:
+          self._mark_finished(3)
+        self.end_reason = "enemy_out"
         stopped_early = True
         break
 
@@ -2165,25 +2657,38 @@ async def handler(ws: ServerConnection, server: MiniDanServer):
   try:
     # 保持连接存活；由主循环驱动消息收发。
     await ws.wait_closed()
+  except Exception as e:
+    _log_exception(f"[server] handler error (seat={seat}, path={path}): ", e)
   finally:
-    server.seat_conns.pop(seat, None)
+    try:
+      server.seat_conns.pop(seat, None)
+    except Exception:
+      pass
 
 
 async def main_async(args):
-  try:
-    import websockets  # type: ignore
-  except Exception as e:
-    raise SystemExit(
-      "缺少依赖 websockets，无法启动实验服。\n"
-      "请安装后重试：\n"
-      "  python -m pip install --user websockets\n\n"
-      f"错误：{type(e).__name__}: {e}"
-    )
+  websockets = None
+  if not getattr(args, "inproc_torch", False):
+    try:
+      import websockets as _ws  # type: ignore
+      websockets = _ws
+    except Exception as e:
+      raise SystemExit(
+        "缺少依赖 websockets，无法启动实验服。\n"
+        "请安装后重试：\n"
+        "  python -m pip install --user websockets\n\n"
+        f"错误：{type(e).__name__}: {e}"
+      )
 
-  # 首局 AI 手牌：允许从参数/GUI 输入；后续“重新开局”默认随机发牌。
+  # 首局 AI 手牌：允许从参数/GUI 输入。
   deck = make_double_deck()
   while True:
-    ai_hand = parse_cards_csv(getattr(args, "ai_hand", ""))
+    try:
+      ai_hand = parse_ai_hand_text(getattr(args, "ai_hand", ""))
+    except Exception as e:
+      print(f"AI 手牌输入无法解析：{e}。请重新输入或直接回车随机。")
+      args.ai_hand = _prompt_ai_hand(args.cur_rank)
+      continue
     if not ai_hand:
       random.shuffle(deck)
       ai_hand = deck[:27]
@@ -2215,9 +2720,650 @@ async def main_async(args):
   torch_dir = os.path.abspath(os.path.join(repo_root, "wintest", "torch"))
   child_procs: List[subprocess.Popen] = []
 
+  if getattr(args, "inproc_torch", False):
+    # 纯单进程模式：不启动 websockets，不启动子进程，不做超时。
+    sys.path.insert(0, torch_dir)
+    from inproc_agent import TorchInProcAgent  # type: ignore
+
+    inproc_weights_path = os.path.join(torch_dir, "models", "ppo_inproc_latest.pth")
+    inproc_q_weights_path = os.path.join(torch_dir, "models", "q_inproc_latest.pth")
+
+    server.seat0_inproc_agent = TorchInProcAgent(
+      seat=0,
+      model_iter=0,
+      weights_override_path=inproc_weights_path,
+      q_weights_override_path=inproc_q_weights_path,
+    )
+    server.seat0_inproc_agent.on_beginning(
+      curRank=str(args.cur_rank),
+      selfRank=str(args.self_rank),
+      oppoRank=str(args.oppo_rank),
+    )
+
+    print("[server] inproc-torch enabled: no websockets/ZMQ/subprocesses.")
+    print(f"AI seat0 hand ({len(ai_hand)}): {format_cards_for_human(ai_hand)}")
+
+    # 可选：在开局前录入“进贡/还贡/抗贡”的公开信息（明牌），并允许模型为 seat0 做出进/还贡决策。
+    # 默认不启用：只有在启动时显式指定参数才会进入贡牌流程，避免打扰默认“只复盘出牌阶段”的使用方式。
+    def _yes(prompt: str) -> bool:
+      try:
+        s = input(prompt).strip().lower()
+      except Exception:
+        return False
+      return s in {"y", "yes", "1", "是", "开", "true"}
+
+    def _parse_seat(s: str) -> Optional[int]:
+      try:
+        v = int(s)
+      except Exception:
+        return None
+      return v if v in (0, 1, 2, 3) else None
+
+    def _parse_card_token(tok: str) -> Optional[str]:
+      t = tok.strip().upper()
+      if not t:
+        return None
+      if t in {"HR", "SB"}:
+        return t
+      if len(t) != 2:
+        return None
+      if t[0] not in {"S", "H", "C", "D"}:
+        return None
+      if t[1] not in set("23456789TJQKA"):
+        return None
+      return t
+
+    def _collect_result_lines(kind: str) -> List[List[Any]]:
+      print(f"请输入{kind}结果：每行格式 'fromSeat toSeat CARD'，例如 '3 0 S2'；直接回车结束。")
+      out: List[List[Any]] = []
+      while True:
+        line = input("> ").strip()
+        if not line:
+          break
+        parts = line.split()
+        if len(parts) != 3:
+          print("格式错误：需要 3 个字段。")
+          continue
+        a = _parse_seat(parts[0])
+        b = _parse_seat(parts[1])
+        c = _parse_card_token(parts[2])
+        if a is None or b is None or c is None:
+          print("格式错误：seat 需为 0-3，CARD 形如 S2/H9/DT/HR/SB。")
+          continue
+        out.append([a, b, c])
+      return out
+
+    def _base_value(card: str) -> int:
+      if card == "HR":
+        return 100
+      if card == "SB":
+        return 99
+      r = card[-1]
+      m = {"2": 2, "3": 3, "4": 4, "5": 5, "6": 6, "7": 7, "8": 8, "9": 9, "T": 10, "J": 11, "Q": 12, "K": 13, "A": 14}
+      return int(m.get(r, 0))
+
+    def _tribute_strength(card: str, cur_rank: str) -> int:
+      if card == "HR":
+        return 1000
+      if card == "SB":
+        return 900
+      if len(card) == 2 and card[-1] == str(cur_rank):
+        return 800
+      return _base_value(card)
+
+    if bool(getattr(args, "enable_tribute_flow", False)):
+      # 1) 录入 notify(tribute/back) 的公开信息（用于模型在 play 阶段“看到”明牌）
+      if _yes("录入进贡结果 notify(tribute)？[y/N]: "):
+        tr = _collect_result_lines("进贡")
+        if tr:
+          try:
+            server.seat0_inproc_agent.on_notify_tribute(tr)
+          except Exception:
+            pass
+
+      if _yes("录入还贡结果 notify(back)？[y/N]: "):
+        br = _collect_result_lines("还贡")
+        if br:
+          try:
+            server.seat0_inproc_agent.on_notify_back(br)
+          except Exception:
+            pass
+
+      if _yes("录入抗贡信息 notify(anti-tribute)？[y/N]: "):
+        s = input("请输入抗贡座位（空格分隔，例如 '1 3'；直接回车表示无）：").strip()
+        anti = []
+        if s:
+          for tok in s.split():
+            v = _parse_seat(tok)
+            if v is not None:
+              anti.append(v)
+        try:
+          server.seat0_inproc_agent.on_notify_anti(anti, len(anti))
+        except Exception:
+          pass
+
+      # 2) 可选：让模型为 seat0 给出“进贡/还贡”的建议（用于你在真实牌局里参考）。
+      # 注意：标准规则要求“进贡牌必须是手中最大的牌（红心参谋除外）”，因此多数情况下候选集很小。
+      if _yes("让模型为 seat0 选择进贡牌（act(tribute)）？[y/N]: "):
+        to_s = input("请输入 seat0 进贡给谁（toSeat=0-3）：").strip()
+        to_pos = _parse_seat(to_s)
+        if to_pos is not None:
+          red_adviser = f"H{str(args.cur_rank)}"
+          candidates = [c for c in list(server.ai_hand) if c != red_adviser]
+          if not candidates:
+            candidates = [c for c in list(server.ai_hand)]
+          best = max((_tribute_strength(c, str(args.cur_rank)) for c in candidates), default=0)
+          best_cards = [c for c in candidates if _tribute_strength(c, str(args.cur_rank)) == best]
+          action_list = [["Single", "A", [c]] for c in best_cards]
+          msg = {
+            "type": "act",
+            "stage": "tribute",
+            "handCards": list(server.ai_hand),
+            "actionList": action_list,
+            "indexRange": len(action_list) - 1,
+            "curRank": server.cur_rank,
+            "selfRank": server.self_rank,
+            "oppoRank": server.oppo_rank,
+            "curPos": 0,
+            "curAction": None,
+            "greaterPos": -1,
+            "greaterAction": ["PASS", "PASS", []],
+          }
+          try:
+            idx = int(server.seat0_inproc_agent.act_tribute(msg))
+          except Exception:
+            idx = 0
+          idx = max(0, min(idx, len(action_list) - 1))
+          chosen = action_list[idx][2][0]
+          print(f"[inproc] 建议 seat0 进贡：{format_card_for_human(chosen)} -> Seat{to_pos}")
+
+      if _yes("让模型为 seat0 选择还贡牌（act(back)）？[y/N]: "):
+        to_s = input("请输入 seat0 还贡给谁（toSeat=0-3）：").strip()
+        to_pos = _parse_seat(to_s)
+        if to_pos is not None:
+          # 规则：还给己方搭档必须是 10 以下(含10)；还给对方可任意。
+          need_leq10 = (to_pos == 2)
+          cand = [c for c in list(server.ai_hand) if (not need_leq10) or (_base_value(c) <= 10)]
+          if not cand:
+            cand = list(server.ai_hand)
+          action_list = [["Single", "A", [c]] for c in cand]
+          msg = {
+            "type": "act",
+            "stage": "back",
+            "handCards": list(server.ai_hand),
+            "actionList": action_list,
+            "indexRange": len(action_list) - 1,
+            "curRank": server.cur_rank,
+            "selfRank": server.self_rank,
+            "oppoRank": server.oppo_rank,
+            "curPos": 0,
+            "curAction": None,
+            "greaterPos": -1,
+            "greaterAction": ["PASS", "PASS", []],
+          }
+          try:
+            idx = int(server.seat0_inproc_agent.act_back(msg))
+          except Exception:
+            idx = 0
+          idx = max(0, min(idx, len(action_list) - 1))
+          chosen = action_list[idx][2][0]
+          print(f"[inproc] 建议 seat0 还贡：{format_card_for_human(chosen)} -> Seat{to_pos}")
+
+    # 需求：模型推理出任何错误就让主线程/进程崩掉；这里不捕获异常。
+    status = await server.run_game_loop()
+
+    # 对局结束后：按 finish_order 生成多次(主角, reward)训练事件。
+    # 注意：根据最新规则，允许对“未出完但需要被训练”的主角训练；
+    # 这要求我们能在局末推断其剩余手牌（通过两副牌牌库扣除）。
+    def _compute_inproc_training_events(order: List[int]) -> List[Tuple[int, float]]:
+      if not order:
+        return []
+
+      o = [int(x) for x in order]
+      enemies = {1, 3}
+
+      # 规则 0：AI 第 1 个出完。
+      if o[0] == 0:
+        return [(0, 2.0)]
+
+      # 规则 1：队友第 1 个出完。
+      if o[0] == 2:
+        # 1.1 队友第 1，AI 第 2：我方明显优势。
+        if len(o) >= 2 and o[1] == 0:
+          return [(0, 3.0), (2, 3.0)]
+
+        # 1.2【新规则】队友第 1，AI 第 3：我方胜，但需要对“两敌”都给负奖励。
+        # 形如 [2, 1, 0] 或 [2, 3, 0]；最后一个未出完的一定是另一个敌人。
+        if len(o) >= 3 and o[2] == 0 and o[1] in enemies:
+          return [(0, 2.0), (2, 2.0), (1, -2.0), (3, -2.0)]
+
+        # 1.3 队友第 1 个出完，AI 未出完（牌没出完，被剩下），且两敌都已出完导致停局：
+        # 胜负判定以“第一个出完的人在哪一方”为准，因此这里依然是我方胜利。
+        # 给我方正奖励、两敌负奖励。
+        # 例：finish_order=[2,1,3] 或 [2,3,1]
+        if len(o) >= 3 and 0 not in o and 1 in o and 3 in o:
+          return [(0, 1.0), (2, 1.0), (1, -1.0), (3, -1.0)]
+
+        return []
+
+      # 敌人先出完…
+      if o[0] in enemies:
+        first_enemy = o[0]
+        other_enemy = 3 if first_enemy == 1 else 1
+
+        # 一个敌人先出完，AI第2个出完：
+        # 以先出完的敌人为主角训一次reward+1.5，以AI为主角训一次reward-1.5
+        if len(o) >= 2 and o[1] == 0:
+          return [(first_enemy, 1.5), (0, -1.5)]
+
+        # 2.1【新规则】两个敌人先出完，AI 和队友都被剩下：
+        # 敌方胜：两敌各 +3；AI/队友各 -3。
+        if len(o) >= 2 and o[1] == other_enemy:
+          return [(first_enemy, 3.0), (other_enemy, 3.0), (0, -3.0), (2, -3.0)]
+
+        # 2.2【新规则】一个敌人先出完，队友第2，AI第3：敌方胜利。
+        # 两敌各 +1；AI/队友各 -1。
+        if len(o) >= 3 and o[1] == 2 and o[2] == 0:
+          return [(first_enemy, 1.0), (other_enemy, 1.0), (2, -1.0), (0, -1.0)]
+
+        # 一个敌人先出完，队友第2个出完，另一个敌人第3个出完，且 AI 未出完（finish_order 里没有 0）：
+        # 以两个敌人为主角各训一次reward+2，以AI和队友为主角各训一次reward-2
+        # 例：finish_order=[1,2,3] 或 [3,2,1]
+        if len(o) >= 3 and o[1] == 2 and o[2] == other_enemy and 0 not in o:
+          return [(first_enemy, 2.0), (other_enemy, 2.0), (0, -2.0), (2, -2.0)]
+
+        # 一个敌人先出完，队友第2个出完，AI第3个出完…(上面已覆盖)
+
+        return []
+
+      return []
+
+    def _infer_unfinished_human_remaining_hand(seat: int) -> Optional[List[Card]]:
+      """推断“唯一未出完的人类座位”的剩余手牌。
+
+      方法：两副牌牌库 - AI 起手牌 - 所有人类已出过的牌 = 所有人类未出过的牌。
+      当且仅当“人类座位里只有一个人未出完”时，这个集合才能唯一归属于该座位。
+      """
+      s = int(seat)
+      if s not in (1, 2, 3):
+        return None
+
+      if int(server.human_remaining.get(s, 27)) <= 0:
+        return []
+
+      unfinished = [p for p in (1, 2, 3) if int(server.human_remaining.get(p, 27)) > 0]
+      if len(unfinished) != 1 or int(unfinished[0]) != s:
+        return None
+
+      deck = make_double_deck()
+      ai_init = getattr(server, "ai_hand_initial", None)
+      if not ai_init:
+        # 兜底：用“当前剩余 + 已出”拼回起手牌。
+        ai_init = list(getattr(server, "ai_hand", []) or []) + list(server.played_by_seat.get(0, []) or [])
+
+      try:
+        remove_multiset(deck, list(ai_init))
+        # 注意：deck 此时代表“所有人类的起手牌”。把所有人类已出过的牌扣掉后，剩下即为“所有人类未出过的牌”。
+        for p in (1, 2, 3):
+          remove_multiset(deck, list(server.played_by_seat.get(p, []) or []))
+      except Exception:
+        return None
+
+      expected = int(server.human_remaining.get(s, 27))
+      if expected < 0:
+        expected = 0
+      if len(deck) != expected:
+        # 计数不匹配时，宁可不训练也不要用错牌面。
+        return None
+
+      return deck
+
+    def _infer_human_init_hand(seat: int) -> Optional[List[Card]]:
+      """推断/恢复人类座位起手牌。
+
+      - 若已出完：起手牌就是其整局出过的牌。
+      - 若未出完：仅在其是“唯一未出完人类座位”时，可通过牌库扣除推断剩余手牌，从而恢复起手牌。
+      """
+      s = int(seat)
+      if s not in (1, 2, 3):
+        return None
+      played = list(server.played_by_seat.get(s, []) or [])
+
+      if int(server.human_remaining.get(s, 27)) <= 0:
+        return played if played else None
+
+      rem = _infer_unfinished_human_remaining_hand(s)
+      if rem is None:
+        return None
+      # rem==[] 表示已出完（上面已提前返回），这里 rem 为空也仍然合法。
+      init_hand = played + list(rem)
+      if len(init_hand) != 27:
+        # 起手牌必须 27；不满足则拒绝，避免训练错轨迹。
+        return None
+      return init_hand
+
+    def _action_sig(a: Action) -> Tuple[Any, ...]:
+      try:
+        t = a[0]
+        k = a[1]
+        cards = tuple(sorted(a[2]))
+        vr = None
+        vc = None
+        if isinstance(a, list) and len(a) >= 4 and isinstance(a[3], dict):
+          vr0 = a[3].get("virtual_ranks")
+          vc0 = a[3].get("virtual_cards")
+          vr = tuple(vr0) if isinstance(vr0, list) else None
+          vc = tuple(vc0) if isinstance(vc0, list) else None
+        return (t, k, cards, vr, vc)
+      except Exception:
+        return (str(a),)
+
+    def _build_human_trajectory(seat: int) -> List[Tuple[np.ndarray, np.ndarray, int]]:
+      """对人类座位离线回放，生成与 seat0 兼容的 (obs, legal_mask, chosen) 轨迹。
+
+      允许未出完：仅当其是“唯一未出完人类座位”时，可推断其剩余手牌并恢复起手牌。
+      """
+      s = int(seat)
+      if s not in (1, 2, 3):
+        return []
+
+      init_hand = _infer_human_init_hand(s)
+      if not init_hand:
+        return []
+
+      agent = TorchInProcAgent(
+        seat=s,
+        model_iter=0,
+        weights_override_path=inproc_weights_path,
+        q_weights_override_path=inproc_q_weights_path,
+      )
+      agent.on_beginning(curRank=str(args.cur_rank), selfRank=str(args.self_rank), oppoRank=str(args.oppo_rank))
+
+      my_hand = init_hand[:]
+      remaining = {0: 27, 1: 27, 2: 27, 3: 27}
+      greater_action: Optional[Action] = None
+      greater_pos: Optional[int] = None
+      passes_since_play = 0
+
+      traj: List[Tuple[np.ndarray, np.ndarray, int]] = []
+
+      for pos, act in list(getattr(server, "play_history", []) or []):
+        pos = int(pos)
+
+        # 若当前轮到该座位出牌，则用当时手牌与 greater_action 复现 actionList 并定位其真实选择。
+        if pos == s:
+          all_actions = generate_actions_from_hand(my_hand, server.cur_rank)
+          if greater_action is None:
+            action_list = all_actions
+          else:
+            filtered = [a for a in all_actions if beats(a, greater_action, server.cur_rank)]
+            action_list = [["PASS", "PASS", []]] + filtered
+          if not action_list:
+            action_list = [["PASS", "PASS", []]]
+
+          msg = {
+            "type": "act",
+            "stage": "play",
+            "handCards": my_hand,
+            "actionList": action_list,
+            "indexRange": len(action_list) - 1,
+            "curRank": server.cur_rank,
+            "selfRank": server.self_rank,
+            "oppoRank": server.oppo_rank,
+            "curPos": pos,
+            "curAction": None,
+            "greaterPos": (greater_pos if greater_pos is not None else -1),
+            "greaterAction": (greater_action if greater_action is not None else ["PASS", "PASS", []]),
+          }
+
+          act_sig = _action_sig(act)
+          chosen_idx = None
+          for i, cand in enumerate(action_list):
+            if _action_sig(cand) == act_sig:
+              chosen_idx = i
+              break
+
+          if chosen_idx is not None:
+            try:
+              obs_vec, legal_mask, top_indexs = agent.build_obs_for_message(msg)
+              if chosen_idx in top_indexs:
+                chosen = int(top_indexs.index(chosen_idx))
+                traj.append((obs_vec, legal_mask, chosen))
+            except Exception:
+              pass
+
+        # 推进 agent 的历史状态（无论谁出牌）。
+        try:
+          agent.on_notify_play(pos, act)
+        except Exception:
+          pass
+
+        # 更新该座位自己的手牌。
+        if pos == s and isinstance(act, list) and len(act) >= 3 and act[0] != "PASS":
+          for c in list(act[2]):
+            try:
+              my_hand.remove(c)
+            except Exception:
+              pass
+
+        # 更新剩余牌，用于复现“墩结束”复位逻辑。
+        if isinstance(act, list) and len(act) >= 3 and act[0] != "PASS":
+          remaining[pos] = max(0, int(remaining.get(pos, 27)) - len(act[2]))
+
+        if isinstance(act, list) and len(act) >= 1 and act[0] == "PASS":
+          passes_since_play += 1
+        else:
+          greater_action = act
+          greater_pos = pos
+          passes_since_play = 0
+
+        active_after = [p for p in range(4) if int(remaining.get(p, 27)) > 0]
+        leader_active = False
+        try:
+          if greater_pos is not None:
+            leader_active = int(remaining.get(int(greater_pos), 27)) > 0
+        except Exception:
+          leader_active = False
+        required_passes = max(0, len(active_after) - (1 if leader_active else 0))
+        if greater_action is not None and passes_since_play >= required_passes:
+          # 下一墩先手：若赢家已出完，则队友优先先手。
+          try:
+            lead = int(greater_pos) if greater_pos is not None else int(pos)
+          except Exception:
+            lead = int(pos)
+          if int(remaining.get(lead, 27)) > 0:
+            pass
+          else:
+            teammate = (lead + 2) % 4
+            # 回放时不用真的改 pos 指针（由 history 驱动），这里只是保持复位逻辑一致。
+            # 关键在于清空 greater_action/greater_pos，让下一次 actionList 构造按先手规则走。
+            if int(remaining.get(teammate, 27)) > 0:
+              pass
+          greater_action = None
+          greater_pos = None
+          passes_since_play = 0
+
+      return traj
+
+    def _build_human_q_trajectory(seat: int) -> List[Tuple[np.ndarray, int]]:
+      """对人类座位离线回放，生成 q_network 训练用的 (x_batch, chosen_action_index) 轨迹。
+
+      允许未出完：仅当其是“唯一未出完人类座位”时，可推断其剩余手牌并恢复起手牌。
+      """
+      s = int(seat)
+      if s not in (1, 2, 3):
+        return []
+
+      init_hand = _infer_human_init_hand(s)
+      if not init_hand:
+        return []
+
+      agent = TorchInProcAgent(
+        seat=s,
+        model_iter=0,
+        weights_override_path=inproc_weights_path,
+        q_weights_override_path=inproc_q_weights_path,
+      )
+      agent.on_beginning(curRank=str(args.cur_rank), selfRank=str(args.self_rank), oppoRank=str(args.oppo_rank))
+
+      my_hand = init_hand[:]
+      remaining = {0: 27, 1: 27, 2: 27, 3: 27}
+      greater_action: Optional[Action] = None
+      greater_pos: Optional[int] = None
+      passes_since_play = 0
+
+      traj: List[Tuple[np.ndarray, int]] = []
+
+      for pos, act in list(getattr(server, "play_history", []) or []):
+        pos = int(pos)
+
+        if pos == s:
+          all_actions = generate_actions_from_hand(my_hand, server.cur_rank)
+          if greater_action is None:
+            action_list = all_actions
+          else:
+            filtered = [a for a in all_actions if beats(a, greater_action, server.cur_rank)]
+            action_list = [["PASS", "PASS", []]] + filtered
+          if not action_list:
+            action_list = [["PASS", "PASS", []]]
+
+          msg = {
+            "type": "act",
+            "stage": "play",
+            "handCards": my_hand,
+            "actionList": action_list,
+            "indexRange": len(action_list) - 1,
+            "curRank": server.cur_rank,
+            "selfRank": server.self_rank,
+            "oppoRank": server.oppo_rank,
+            "curPos": pos,
+            "curAction": None,
+            "greaterPos": (greater_pos if greater_pos is not None else -1),
+            "greaterAction": (greater_action if greater_action is not None else ["PASS", "PASS", []]),
+          }
+
+          act_sig = _action_sig(act)
+          chosen_idx = None
+          for i, cand in enumerate(action_list):
+            if _action_sig(cand) == act_sig:
+              chosen_idx = i
+              break
+
+          if chosen_idx is not None:
+            try:
+              st = agent.prepare(msg)
+              xb = st.get("x_batch") if isinstance(st, dict) else None
+              if isinstance(xb, np.ndarray) and xb.ndim == 2 and 0 <= int(chosen_idx) < int(xb.shape[0]):
+                traj.append((xb, int(chosen_idx)))
+            except Exception:
+              pass
+
+        try:
+          agent.on_notify_play(pos, act)
+        except Exception:
+          pass
+
+        if pos == s and isinstance(act, list) and len(act) >= 3 and act[0] != "PASS":
+          for c in list(act[2]):
+            try:
+              my_hand.remove(c)
+            except Exception:
+              pass
+
+        if isinstance(act, list) and len(act) >= 3 and act[0] != "PASS":
+          remaining[pos] = max(0, int(remaining.get(pos, 27)) - len(act[2]))
+
+        if isinstance(act, list) and len(act) >= 1 and act[0] == "PASS":
+          passes_since_play += 1
+        else:
+          greater_action = act
+          greater_pos = pos
+          passes_since_play = 0
+
+        active_after = [p for p in range(4) if int(remaining.get(p, 27)) > 0]
+        leader_active = False
+        try:
+          if greater_pos is not None:
+            leader_active = int(remaining.get(int(greater_pos), 27)) > 0
+        except Exception:
+          leader_active = False
+        required_passes = max(0, len(active_after) - (1 if leader_active else 0))
+        if greater_action is not None and passes_since_play >= required_passes:
+          greater_action = None
+          greater_pos = None
+          passes_since_play = 0
+
+      return traj
+
+    order = getattr(server, "finish_order", [])
+    events = _compute_inproc_training_events(order)
+    events = [(int(s), float(r)) for (s, r) in events]
+
+    try:
+      trainer = server.seat0_inproc_agent
+      total_n = 0
+      last_loss = 0.0
+      for seat, rew in events:
+        seat = int(seat)
+        if seat == 0:
+          traj0 = getattr(server.seat0_inproc_agent, "trajectory", None)
+          if not traj0:
+            continue
+          info = trainer.train_on_trajectory(traj0, reward=float(rew), lr=1e-4, clear=True)
+        else:
+          traj_h = _build_human_trajectory(seat)
+          if not traj_h:
+            continue
+          info = trainer.train_on_trajectory(traj_h, reward=float(rew), lr=1e-4, clear=True)
+        total_n += int(info.get("n", 0))
+        last_loss = float(info.get("loss", 0.0))
+
+      # q_network：跟 PPO 一样按 events 逐个主角训练一次。
+      q_total_n = 0
+      q_last_loss = 0.0
+      for seat, rew in events:
+        seat = int(seat)
+        if float(rew) == 0.0:
+          continue
+        if seat == 0:
+          q_traj0 = getattr(server.seat0_inproc_agent, "q_trajectory", None)
+          if not q_traj0:
+            continue
+          q_info = trainer.train_q_on_trajectory(q_traj0, reward=float(rew), lr=5e-5, clear=False)
+        else:
+          q_traj_h = _build_human_q_trajectory(seat)
+          if not q_traj_h:
+            continue
+          q_info = trainer.train_q_on_trajectory(q_traj_h, reward=float(rew), lr=5e-5, clear=False)
+        q_total_n += int(q_info.get("n", 0))
+        q_last_loss = float(q_info.get("loss", 0.0))
+
+      # 避免跨局累积。
+      try:
+        q_traj0 = getattr(server.seat0_inproc_agent, "q_trajectory", None)
+        if q_traj0 is not None and hasattr(q_traj0, "clear"):
+          q_traj0.clear()
+      except Exception:
+        pass
+
+      os.makedirs(os.path.dirname(inproc_weights_path), exist_ok=True)
+      trainer.save_actor_weights(inproc_weights_path)
+      trainer.save_q_weights(inproc_q_weights_path)
+      print(f"[server] finish_order={order} events={events}")
+      print(f"[server] inproc training done: n={total_n}, loss={last_loss}")
+      print(f"[server] saved weights: {inproc_weights_path}")
+      print(f"[server] q_network update: n={q_total_n}, loss={q_last_loss}")
+      print(f"[server] saved q_network: {inproc_q_weights_path}")
+    except Exception as e:
+      # 训练失败不应影响你手动复盘；这里打印并继续返回。
+      _log_exception("[server] inproc training failed: ", e)
+
+    return status
+
   try:
     try:
-      async with websockets.serve(lambda w: handler(w, server), args.host, args.port):
+      # 本机实验服：关闭 keepalive ping，避免 AI 客户端在计算/阻塞时被误判超时。
+      async with websockets.serve(lambda w: handler(w, server), args.host, args.port, ping_interval=None):
         print(f"mini_danserver listening on ws://{args.host}:{args.port}/game/client0")
         print(f"AI seat0 hand ({len(ai_hand)}): {format_cards_for_human(ai_hand)}")
 
@@ -2260,7 +3406,11 @@ async def main_async(args):
             return "restart_full"
           await asyncio.sleep(0.1)
 
-        status = await server.run_game_loop()
+        try:
+          status = await server.run_game_loop()
+        except Exception as e:
+          _log_exception("[server] run_game_loop crashed: ", e)
+          return "stopped"
         if status == "restart_full":
           return "restart_full"
     except asyncio.CancelledError:
@@ -2290,15 +3440,41 @@ def build_arg_parser() -> argparse.ArgumentParser:
     action="store_true",
     help="不自动启动 actor/client（需要你自己另开终端启动）。默认会自动启动。",
   )
+
+  # 运行模式：默认 inproc（单线程、本进程 torch 推理）。
+  p.set_defaults(inproc_torch=True)
+  p.add_argument(
+    "--ws-mode",
+    dest="inproc_torch",
+    action="store_false",
+    help="使用 websockets+子进程(旧模式)。默认不启用（默认走 inproc 单线程 torch 推理）。",
+  )
+  # 兼容/显式指定：等价于默认值。
+  p.add_argument(
+    "--inproc-torch",
+    dest="inproc_torch",
+    action="store_true",
+    help="在本进程内跑 torch 推理（seat0，默认模式）。",
+  )
+
+  # 贡牌流程：默认关闭；只有显式开启才会在开局阶段进入进贡/还贡/抗贡的录入/建议交互。
+  p.add_argument(
+    "--enable-tribute-flow",
+    dest="enable_tribute_flow",
+    action="store_true",
+    help="启用进贡/还贡/抗贡流程的开局交互（默认不启用）。",
+  )
   return p
 
 
 def _prompt_cur_rank(default: str = "2") -> str:
   allowed = set(list("23456789TJQKA"))
   while True:
-    s = input(f"请输入当前级牌 curRank（默认 {default}，可选 2-9,T,J,Q,K,A）：").strip().upper()
+    s = input(f"请输入当前级牌 curRank（默认 {default}，可选 2-9,10,T,J,Q,K,A）：").strip().upper()
     if not s:
       return default
+    if s == "10":
+      s = "T"
     if s in allowed:
       return s
     print("输入无效，请重新输入。")
@@ -2326,12 +3502,23 @@ def _prompt_ai_hand(cur_rank: str) -> str:
     import tkinter  # noqa: F401
   except Exception:
     return input(
-      "请输入 AI(seat0) 起手 27 张牌（空=随机；用空格/逗号分隔，如: H2 H2 C4 ...）："
+      "请输入 AI(seat0) 起手 27 张牌（空=随机；支持如: H2 H2 C4 或 ♥2 ♣A×2 小JOKER×2 ...）："
     ).strip()
 
   if _HUMAN_PICKER is None:
     _HUMAN_PICKER = _PersistentHumanActionPicker(cur_rank=cur_rank)
-  return _HUMAN_PICKER.pick_ai_hand().strip()
+  else:
+    try:
+      # 级牌变化时在原窗口内刷新，避免关闭/重开导致窗口位置跑掉。
+      _HUMAN_PICKER.set_cur_rank(cur_rank)
+    except Exception:
+      pass
+  try:
+    return _HUMAN_PICKER.pick_ai_hand().strip()
+  except _GuiFallbackToTerminalThisTurn:
+    return input(
+      "请输入 AI(seat0) 起手 27 张牌（空=随机；支持如: H2 H2 C4 或 ♥2 ♣A×2 小JOKER×2 ...）："
+    ).strip()
 
 
 def main():
@@ -2350,10 +3537,16 @@ def main():
       status = asyncio.run(main_async(args))
       if status == "restart_full":
         continue
+
+      # 需求：每局打完（并完成 inproc 训练/保存）后，默认直接开新一局，
+      # 重新走“输入级牌/先手/AI 手牌”的流程，并确保加载最新模型。
+      if getattr(args, "inproc_torch", False):
+        continue
+
       break
   except (KeyboardInterrupt, asyncio.CancelledError, EOFError):
     print("已退出。")
-    return
+    _exit_cleanly(0)
 
 
 if __name__ == "__main__":

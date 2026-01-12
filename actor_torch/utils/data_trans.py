@@ -11,10 +11,18 @@ import torch
 import zmq
 
 
+def _torch_load_bytes_cpu(b: bytes):
+    bio = io.BytesIO(b)
+    try:
+        return torch.load(bio, map_location='cpu', weights_only=True)
+    except TypeError:
+        return torch.load(bio, map_location='cpu')
+
+
 class CPU_Unpickler(pickle.Unpickler):
     def find_class(self, module, name):
         if module == 'torch.storage' and name == '_load_from_bytes':
-            return lambda b: torch.load(io.BytesIO(b), map_location='cpu')
+            return _torch_load_bytes_cpu
         else: return super().find_class(module, name)
 
 

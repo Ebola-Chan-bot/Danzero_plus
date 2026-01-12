@@ -1,6 +1,7 @@
 import json
 import os
 import warnings
+import traceback
 from argparse import ArgumentParser
 from functools import reduce
 from random import randint
@@ -157,6 +158,18 @@ class ExampleClient(WebSocketClient):
         self.context = zmq.Context()
         self.context.linger = 0 
         self.socket = self.context.socket(zmq.REQ)
+        # 避免 actor/ZMQ 异常导致 ws 客户端永久阻塞，从而让服务端一直超时等待 actIndex。
+        # 允许用环境变量覆盖：DAN_ZMQ_TIMEOUT_MS（毫秒）。
+        try:
+            timeout_ms = int(os.getenv('DAN_ZMQ_TIMEOUT_MS', '5000'))
+        except Exception:
+            timeout_ms = 5000
+        try:
+            self.socket.setsockopt(zmq.RCVTIMEO, timeout_ms)
+            self.socket.setsockopt(zmq.SNDTIMEO, timeout_ms)
+            self.socket.setsockopt(zmq.LINGER, 0)
+        except Exception:
+            pass
         self.socket.connect(f'tcp://localhost:{self.args.action_port + self.args.seat}')
 
     def opened(self):
@@ -167,47 +180,55 @@ class ExampleClient(WebSocketClient):
 
     def received_message(self, message):
         # 先序列化收到的消息，转为Python中的字典
-        message = json.loads(str(message))
-        if message['type'] == 'notify':
-            # 牌局开始记录位置
-            if message['stage'] == 'beginning':
-                self.count_A += int(message['curRank'] == 14)
-                self.count_A_self += int(message['selfRank'] == 14)
-                self.count_A_oppo += int(message['oppoRank'] == 14)
-                # print('curRank', message['curRank'])
-                # print('selfRank', message['selfRank'])
-                # print('oppoRank', message['oppoRank'])
-                self.mypos = message['myPos']
-            # 记录进贡的牌
-            elif message['stage'] == 'tribute':
-                self.tribute_result = message['result']
-            # 在动作序列中记录动作
-            elif message['stage'] == 'play':
-                just_play = message['curPos']
-                action = card2num(message['curAction'][2])
-                if message['curPos'] != self.mypos:
-                    for ele in action:
-                        self.other_left_hands[ele] -= 1
-                if len(self.over) == 0:    # 如果没人出完牌
-                    self.action_order.append(just_play)
-                    self.action_seq.append(action)
-                    self.history_action[message['curPos']].append(action)
-                elif len(self.over) == 1:    # 只有一个出完牌的（如果队友也先赢了，就会直接结束）
-                    if len(action) > 0 and self.flag == 1: # 第一轮有人接下来了，则顺序没问题
-                        self.flag = 2
-                        if just_play == (self.over[0] + 3) % 4:     # 是头游的上家接下来的
-                            self.action_order.append(just_play)       
-                            self.action_seq.append(action)
-                            self.history_action[message['curPos']].append(action)
-                            self.action_order.append(self.over[0])      # 添加第一个出完牌的玩家的信息
-                            self.history_action[self.over[0]].append([-1])
-                            self.action_seq.append([-1])
-                            # self.history_action[self.over[0]].append([])
-                            # self.action_seq.append([])
-                        else:
-                            self.action_order.append(just_play)        # 不是头游的上家接的
-                            self.action_seq.append(action)
-                            self.history_action[message['curPos']].append(action)
+        try:
+            message = json.loads(str(message))
+        except Exception as e:
+            print(f"[client{getattr(self.args, 'seat', '?')}] invalid ws message: {type(e).__name__}: {e}")
+            return
+
+        try:
+            if message['type'] == 'notify':
+                # 牌局开始记录位置
+                if message['stage'] == 'beginning':
+                    self.count_A += int(message['curRank'] == 14)
+                    self.count_A_self += int(message['selfRank'] == 14)
+                    self.count_A_oppo += int(message['oppoRank'] == 14)
+                    # print('curRank', message['curRank'])
+                    # print('selfRank', message['selfRank'])
+                    # print('oppoRank', message['oppoRank'])
+                    self.mypos = message['myPos']
+
+                # 记录进贡的牌
+                elif message['stage'] == 'tribute':
+                    self.tribute_result = message['result']
+
+                # 在动作序列中记录动作
+                elif message['stage'] == 'play':
+                    just_play = message['curPos']
+                    action = card2num(message['curAction'][2])
+                    if message['curPos'] != self.mypos:
+                        for ele in action:
+                            self.other_left_hands[ele] -= 1
+                    if len(self.over) == 0:    # 如果没人出完牌
+                        self.action_order.append(just_play)
+                        self.action_seq.append(action)
+                        self.history_action[message['curPos']].append(action)
+                    elif len(self.over) == 1:    # 只有一个出完牌的（如果队友也先赢了，就会直接结束）
+                        if len(action) > 0 and self.flag == 1: # 第一轮有人接下来了，则顺序没问题
+                            self.flag = 2
+                            if just_play == (self.over[0] + 3) % 4:     # 是头游的上家接下来的
+                                self.action_order.append(just_play)
+                                self.action_seq.append(action)
+                                self.history_action[message['curPos']].append(action)
+                                self.action_order.append(self.over[0])      # 添加第一个出完牌的玩家的信息
+                                self.history_action[self.over[0]].append([-1])
+                                self.action_seq.append([-1])
+                                # self.history_action[self.over[0]].append([])
+                                # self.action_seq.append([])
+                            else:
+                                self.action_order.append(just_play)        # 不是头游的上家接的
+                                self.action_seq.append(action)
+                                self.history_action[message['curPos']].append(action)
                     elif self.flag == 1 and (just_play + 1) % 4 == self.over[0]:      # 出完牌后全都没接的情况，由出完牌的对家出牌（如0、1、2、3、2）
                         self.flag = 2
                         self.action_order.append(just_play)        # 添加出完牌的上家
@@ -296,49 +317,69 @@ class ExampleClient(WebSocketClient):
                         self.action_seq.append(action)
                         self.history_action[message['curPos']].append(action)
 
-                self.remaining[just_play] -= len(action)
-                if self.remaining[just_play] == 0:
-                    self.over.append(just_play)
-            else:
-                pass
-        # 需要做动作
-        elif message["type"] == 'act':
-            # 进还贡
-            if message["stage"] == "back":
-                act_index = self.back_action(message, self.mypos, self.tribute_result)
-                self.send(json.dumps({"actIndex": int(act_index)}))
-            elif message["stage"] == "tribute":
-                act_index = self.tribute(message['actionList'], message["curRank"])
-                self.send(json.dumps({"actIndex": int(act_index)}))
-            # 打牌
-            elif message["stage"] == 'play':
-                if self.flag == 0:       # 总共牌减去初始手牌
-                    init_hand = card2num(message['handCards'])
-                    for ele in init_hand:
-                        self.other_left_hands[ele] -= 1
-                    self.flag = 1
+                    self.remaining[just_play] -= len(action)
+                    if self.remaining[just_play] == 0:
+                        self.over.append(just_play)
+                    else:
+                        pass
 
-                # 准备状态数据
-                if len(message['actionList']) == 1:
-                    self.send(json.dumps({"actIndex": 0}))
+            # 需要做动作
+            elif message["type"] == 'act':
+                # 进还贡
+                if message["stage"] == "back":
+                    act_index = self.back_action(message, self.mypos, self.tribute_result)
+                    self.send(json.dumps({"actIndex": int(act_index)}))
+                elif message["stage"] == "tribute":
+                    act_index = self.tribute(message['actionList'], message["curRank"])
+                    self.send(json.dumps({"actIndex": int(act_index)}))
+
+                # 打牌
+                elif message["stage"] == 'play':
+                    if self.flag == 0:       # 总共牌减去初始手牌
+                        init_hand = card2num(message['handCards'])
+                        for ele in init_hand:
+                            self.other_left_hands[ele] -= 1
+                        self.flag = 1
+
+                    # 准备状态数据
+                    if len(message['actionList']) == 1:
+                        self.send(json.dumps({"actIndex": 0}))
                 # elif len(self.over) > 0:
                 #     self.send(json.dumps({"actIndex": randint(0, message["indexRange"])}))
-                else :
-                    state = self.prepare(message)
-                    # print('cliped_legal_actions', cliped_legal_actions)
-                    # print('actionList', message['actionList'])
+                    else:
+                        state = self.prepare(message)
+                        # 传输给决策模块；若 ZMQ/actor 出问题，回退 actIndex=0，避免服务端超时。
+                        try:
+                            self.socket.send(_dumps(state))
+                            act_index = _loads(self.socket.recv())
+                        except Exception as e:
+                            print(
+                                f"[client{getattr(self.args, 'seat', '?')}] ZMQ decision failed: "
+                                f"{type(e).__name__}: {e}; closing websocket (fail-fast)"
+                            )
+                            try:
+                                traceback.print_exc()
+                            except Exception:
+                                pass
+                            try:
+                                self.close()
+                            except Exception:
+                                pass
+                            raise
+                        self.send(json.dumps({"actIndex": int(act_index)}))
 
-                    # state = self.prepare(message)
-                    # 传输给决策模块
-                    self.socket.send(_dumps(state))
-                    # 收到决策
-                    act_index = _loads(self.socket.recv())
-                    # 作出决策
-                    # print('actionList', message['actionList'])
-                    # act_index = 0
-                    # doaction = message['actionList'][int(act_index)]
-                    # print(f'Client{self.mypos} do action{act_index}:{doaction}')
-                    self.send(json.dumps({"actIndex": int(act_index)}))
+        except Exception as e:
+            # 需求：AI 出问题应立即结束游戏。这里主动断开连接，让服务端尽快停止而不是等待超时。
+            print(f"[client{getattr(self.args, 'seat', '?')}] received_message error: {type(e).__name__}: {e}")
+            try:
+                traceback.print_exc()
+            except Exception:
+                pass
+            try:
+                self.close()
+            except Exception:
+                pass
+            raise
 
         # 小局结束，数据重置
         if message['stage'] == 'episodeOver':

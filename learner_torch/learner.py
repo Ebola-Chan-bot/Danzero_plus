@@ -21,6 +21,14 @@ from utils.cmdline import parse_cmdline_kwargs
 
 warnings.filterwarnings("ignore")
 
+
+def _torch_load_bytes_cpu(b: bytes):
+    bio = io.BytesIO(b)
+    try:
+        return torch.load(bio, map_location='cpu', weights_only=True)
+    except TypeError:
+        return torch.load(bio, map_location='cpu')
+
 parser = ArgumentParser()
 parser.add_argument('--env', type=str, default='GuanDan', help='The game environment')
 parser.add_argument('--data_port', type=int, default=5000, help='Learner server port to receive training data')
@@ -46,7 +54,7 @@ parser.add_argument('--ckpt_save_type', type=str, default='weight', help='Type o
 class CPU_Unpickler(pickle.Unpickler):
     def find_class(self, module, name):
         if module == 'torch.storage' and name == '_load_from_bytes':
-            return lambda b: torch.load(io.BytesIO(b), map_location='cpu')
+            return _torch_load_bytes_cpu
         else: return super().find_class(module, name)
 
 def main():

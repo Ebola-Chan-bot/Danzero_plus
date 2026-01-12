@@ -127,8 +127,29 @@ class MLPQNetwork(nn.Module):
         name = ['q_net.0.weight', 'q_net.0.bias', 'q_net.2.weight', 'q_net.2.bias', 'q_net.4.weight', 'q_net.4.bias', 'q_net.6.weight', 'q_net.6.bias', 'q_net.8.weight', 'q_net.8.bias', 'q_net.10.weight', 'q_net.10.bias']
         tensor_weights = []
         for weight in weights:
-            temp = torch.tensor(weight).T
+            temp = torch.tensor(weight)
+            # 仅对 2D 的 Linear 权重做转置；1D bias 等不应转置，且 .T 在非 2D 上会触发告警。
+            if temp.ndim == 2:
+                temp = temp.t()
             tensor_weights.append(temp)
+
+        # 兼容：若当前 q_network 的输入维度大于旧权重（通常发生在增加额外特征后），
+        # 则对第一层 Linear 权重在输入维度方向补 0。
+        try:
+            expected_w = self.q.q_net[0].weight
+            if tensor_weights and tensor_weights[0].ndim == 2 and expected_w.ndim == 2:
+                out_features, in_features = int(expected_w.shape[0]), int(expected_w.shape[1])
+                w0 = tensor_weights[0]
+                if int(w0.shape[0]) == out_features and int(w0.shape[1]) < in_features:
+                    new_w0 = torch.zeros((out_features, in_features), dtype=w0.dtype)
+                    new_w0[:, : int(w0.shape[1])] = w0
+                    tensor_weights[0] = new_w0
+                elif int(w0.shape[0]) == out_features and int(w0.shape[1]) > in_features:
+                    # 兼容：若当前输入维度更小（例如删掉动作特征），则对第一层权重做截断。
+                    tensor_weights[0] = w0[:, :in_features].contiguous()
+        except Exception:
+            pass
+
         new_weights = dict(zip(name, tensor_weights))
         self.q.load_state_dict(new_weights)
         print('load tf weights success')

@@ -1,6 +1,5 @@
 import time
 from argparse import ArgumentParser
-from multiprocessing import Process
 from random import randint
 
 import numpy as np
@@ -8,7 +7,19 @@ import zmq
 import pickle
 import torch
 import io
+import sys
+from pathlib import Path
 from model import MLPActorCritic, MLPQNetwork
+
+
+def _torch_load_bytes_cpu(b: bytes):
+    bio = io.BytesIO(b)
+    try:
+        # PyTorch 新版本会建议显式设置 weights_only=True 以避免不安全反序列化告警。
+        return torch.load(bio, map_location='cpu', weights_only=True)
+    except TypeError:
+        # 兼容旧版 torch（不支持 weights_only 参数）。
+        return torch.load(bio, map_location='cpu')
 
 
 def _dumps(obj) -> bytes:
@@ -45,20 +56,23 @@ parser.add_argument('--seats', type=str, default='1,3',
 class CPU_Unpickler(pickle.Unpickler):
     def find_class(self, module, name):
         if module == 'torch.storage' and name == '_load_from_bytes':
-            return lambda b: torch.load(io.BytesIO(b), map_location='cpu')
+            return _torch_load_bytes_cpu
         else: return super().find_class(module, name)
 
 class Player():
     def __init__(self, args) -> None:
+        base_dir = Path(__file__).resolve().parent
         # 模型初始化
         self.model_id = args.iter * 2000 + 500
         self.model = MLPActorCritic((ActionNumber, 516+ActionNumber * 54), ActionNumber)
-        with open('./models/ppo{}.pth'.format(self.model_id), 'rb') as f:
+        model_path = base_dir / 'models' / f'ppo{self.model_id}.pth'
+        with model_path.open('rb') as f:
             new_weights = CPU_Unpickler(f).load()
         print('load model:', self.model_id)
         self.model.set_weights(new_weights)
         self.model_q = MLPQNetwork(567)
-        with open('./q_network.ckpt', 'rb') as f:
+        q_path = base_dir / 'q_network.ckpt'
+        with q_path.open('rb') as f:
             tf_weights = pickle.load(f)
         self.model_q.load_tf_weights(tf_weights)
 
@@ -88,28 +102,80 @@ class Player():
         return indexs[action]
 
 
-def _run_one_player_forever(index: int, args):
-    try:
-        run_one_player(index, args)
-    except KeyboardInterrupt:
-        # Let the parent process coordinate shutdown.
-        return
-
-
-def run_one_player(index, args):
-    player = Player(args)
-
-    # 初始化zmq
-    context = zmq.Context()
+def _bind_rep_socket(context: zmq.Context, seat: int) -> zmq.Socket:
     socket = context.socket(zmq.REP)
-    socket.bind(f'tcp://*:{6000+index}')
+    socket.linger = 0
+    port = 6000 + seat
+    try:
+        socket.bind(f'tcp://*:{port}')
+    except zmq.ZMQError as e:
+        if getattr(e, 'errno', None) == zmq.EADDRINUSE or 'Address in use' in str(e):
+            print(
+                f"[actor] ZMQ bind failed: tcp://*:{port} already in use (seat={seat}).\n"
+                f"- Likely another actor process is still running or a stale process holds the port.\n"
+                f"- Fix: stop the process using the port, then restart actor."
+            )
+            if sys.platform.startswith('win'):
+                print(
+                    f"[actor] Windows check:\n"
+                    f"  netstat -ano | findstr :{port}\n"
+                    f"  taskkill /PID <PID> /F"
+                )
+            else:
+                print(
+                    f"[actor] Linux/macOS check:\n"
+                    f"  lsof -i :{port}\n"
+                    f"  kill -9 <PID>"
+                )
+        raise
+    return socket
 
-    action_index = 0
-    while True:
-        state = _loads(socket.recv())
-        action_index = player.sample(state)
-        # print(f'actor{index} do action number {action_index}')
-        socket.send(_dumps(action_index))
+
+def run_server(seat_list, args):
+    """Single-process ZMQ server for multiple seats.
+
+    Previous implementation used multiprocessing, which can leave orphan processes
+    on Windows when the parent exits abnormally (closing terminal, force-kill).
+    A single-process poll loop avoids residual child processes entirely.
+    """
+
+    context = zmq.Context()
+    poller = zmq.Poller()
+    seat_by_socket = {}
+    players = {}
+    sockets = []
+
+    try:
+        for seat in seat_list:
+            players[seat] = Player(args)
+            sock = _bind_rep_socket(context, seat)
+            sockets.append(sock)
+            poller.register(sock, zmq.POLLIN)
+            seat_by_socket[sock] = seat
+
+        while True:
+            events = dict(poller.poll(timeout=1000))
+            for sock in list(events.keys()):
+                if events.get(sock) != zmq.POLLIN:
+                    continue
+                seat = seat_by_socket[sock]
+                state = _loads(sock.recv())
+                action_index = players[seat].sample(state)
+                sock.send(_dumps(action_index))
+    finally:
+        for sock in sockets:
+            try:
+                poller.unregister(sock)
+            except Exception:
+                pass
+            try:
+                sock.close(0)
+            except Exception:
+                pass
+        try:
+            context.term()
+        except Exception:
+            pass
 
 
 def main():
@@ -123,28 +189,10 @@ def main():
     if not seat_list:
         raise SystemExit("--seats must specify at least one seat.")
 
-    players = []
-    for i in seat_list:
-        # print(f'start{i}')
-        p = Process(target=_run_one_player_forever, args=(i, args))
-        p.start()
-        time.sleep(0.5)
-        players.append(p)
-
     try:
-        for player in players:
-            player.join()
+        run_server(seat_list, args)
     except KeyboardInterrupt:
-        for p in players:
-            try:
-                p.terminate()
-            except Exception:
-                pass
-        for p in players:
-            try:
-                p.join(timeout=2)
-            except Exception:
-                pass
+        return
 
 
 if __name__ == '__main__':

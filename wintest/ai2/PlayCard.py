@@ -38,6 +38,55 @@ class PlayCard():
             pass
         return cards
 
+    def _adviser_opportunity_cost(self, cards, curRank, hand_size=None):
+        """Opportunity-cost penalty for consuming adviser cards ('H'+curRank).
+
+        设计目标：早期惩罚重、晚期惩罚轻。
+
+        - ai2 的剩余手牌估值(restValue)不会把参谋当癞子，因此容易过早打掉参谋。
+        - 这里用一个“阶段缩放”的机会成本惩罚，引导早期保留参谋以获得未来灵活性。
+        """
+        if not isinstance(cards, list):
+            return 0.0
+
+        adviser = 'H' + str(curRank)
+        n = 0
+        for c in cards:
+            if c == adviser:
+                n += 1
+        if n <= 0:
+            return 0.0
+
+        stage = None
+        try:
+            stage = getattr(Strategy, 'roundStage', None)
+        except Exception:
+            stage = None
+
+        # 每张参谋的基础机会成本：阶段越早越重（可按体验再调）
+        if stage == 'ending':
+            per = 0.15
+        elif stage == 'middle':
+            per = 0.30
+        elif stage == 'beginning':
+            per = 0.45
+        else:
+            # 兜底：按手牌张数粗略判断阶段
+            try:
+                hs = int(hand_size) if hand_size is not None else None
+            except Exception:
+                hs = None
+            if hs is None:
+                per = 0.35
+            elif hs >= 15:
+                per = 0.45
+            elif hs >= 9:
+                per = 0.30
+            else:
+                per = 0.15
+
+        return per * float(n)
+
     def _best_from_full_action_list(self, handCards, curRank, fullActionList, mode="free", formerAction=None):
         """Pick the best action directly from server-provided actionList.
 
@@ -87,6 +136,9 @@ class PlayCard():
             if thisHandValue < 0:
                 thisHandValue = 0
             total = thisHandValue + restValue
+            # 机会成本：用掉参谋要扣分，避免过于激进。
+            if typ != 'PASS':
+                total -= self._adviser_opportunity_cost(cards, curRank, hand_size=len(handCards) if isinstance(handCards, list) else None)
 
             tie_smaller = False
             if best is not None and total == best_value:
@@ -195,9 +247,10 @@ class PlayCard():
                         # print(Strategy.actionValueRevise)
                         # print(rank, card, thisHandValue, restValue)
                         if (thisHandValue < 0): thisHandValue = 0
-                        if (thisHandValue + restValue > maxValue or (thisHandValue + restValue == maxValue and \
+                        total = thisHandValue + restValue - self._adviser_opportunity_cost(action, curRank, hand_size=len(handCards) if isinstance(handCards, list) else None)
+                        if (total > maxValue or (total == maxValue and \
                             (bestPlay == [] or CompareRank().Smaller(type, rank, card, bestPlay, curRank)))):
-                            maxValue = thisHandValue + restValue
+                            maxValue = total
                             bestPlay = {"action": action, "type": type, "rank": rank}
 
             #try additional list
@@ -218,9 +271,10 @@ class PlayCard():
                 # print(Strategy.actionValueRevise)
                 # print(rank, card, thisHandValue, restValue)
                 if (thisHandValue < 0): thisHandValue = 0
-                if (thisHandValue + restValue > maxValue or (thisHandValue + restValue == maxValue and
+                total = thisHandValue + restValue - self._adviser_opportunity_cost(action[2], curRank, hand_size=len(handCards) if isinstance(handCards, list) else None)
+                if (total > maxValue or (total == maxValue and
                                 (bestPlay == [] or CompareRank().Smaller(type, rank, card, bestPlay, curRank)))):
-                    maxValue = thisHandValue + restValue
+                    maxValue = total
                     bestPlay = {"action": action[2], "type": type, "rank": rank}
 
         #print("bestplay:",bestPlay, "handValue", handValue)
@@ -280,9 +334,10 @@ class PlayCard():
                         #print(Strategy.actionValueRevise)
                         #print(rank, card, thisHandValue, restValue)
                         if (thisHandValue < 0): thisHandValue = 0
-                        if (thisHandValue + restValue > maxValue or (thisHandValue + restValue == maxValue and \
+                        total = thisHandValue + restValue - self._adviser_opportunity_cost(action, curRank, hand_size=len(handCards) if isinstance(handCards, list) else None)
+                        if (total > maxValue or (total == maxValue and \
                         (bestPlay==[] or CompareRank().Smaller(type, rank, card, bestPlay, curRank)))):
-                            maxValue = thisHandValue + restValue
+                            maxValue = total
                             bestPlay = {"action": action, "type": type, "rank": rank}
 
         #try additional list
@@ -303,9 +358,10 @@ class PlayCard():
                 # print(Strategy.actionValueRevise)
                 # print(rank, card, thisHandValue, restValue)
                 if (thisHandValue < 0): thisHandValue = 0
-                if (thisHandValue + restValue > maxValue or (thisHandValue + restValue == maxValue and
+                total = thisHandValue + restValue - self._adviser_opportunity_cost(action[2], curRank, hand_size=len(handCards) if isinstance(handCards, list) else None)
+                if (total > maxValue or (total == maxValue and
                                                 (bestPlay == [] or CompareRank().Smaller(type, rank, card, bestPlay, curRank)))):
-                    maxValue = thisHandValue + restValue
+                    maxValue = total
                     bestPlay = {"action": action[2], "type": type, "rank": rank}
 
         if (bestPlay==[]):
