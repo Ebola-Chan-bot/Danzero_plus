@@ -130,7 +130,7 @@ def _adapt_actor_state_dict_for_obs_dim(weights: dict, target_obs_dim: int) -> d
 
     - 观测维度扩展：对第一层输入权重右侧补 0
     - 观测维度缩小：对第一层输入权重做截断
-    - 特殊兼容：旧 actor(843维) -> 新 actor(847维) 的“有意义映射”
+    - 特殊兼容：旧 actor(843维) -> 新 actor(847/849/862维) 的“有意义映射”
     """
 
     if not isinstance(weights, dict):
@@ -149,13 +149,13 @@ def _adapt_actor_state_dict_for_obs_dim(weights: dict, target_obs_dim: int) -> d
         return weights
 
     # 旧版本 actor 输入（843）= x_no_action(709, 动作前全状态) + top2_action(2*67)
-    # 新版本 actor 输入（847）= invariant(571, 与候选无关) + top2_variant(2*138)
-    #   其中每个 variant = my_hand_after(54) + universal_after(12) + last_action_after(67) + rel_greater_after(5)
+    # 新版本 actor 输入（849/862）= invariant(571, 与候选无关) + top2_variant(2*139) + deck_universal(13)
+    #   其中每个 variant = my_hand_after(54) + universal_after(13) + last_action_after(67) + rel_greater_after(5)
     # 由于语义变化，无法完全等价映射；这里做一个尽量“对齐不变信息”的映射：
     # - invariant：从旧的 x_no_action 中抽取对应子段
     # - 每个槽位的 last_action_after(67)：复用旧 top_action(67) 的权重
     # 其余新增维度默认置 0。
-    if int(in_features) == 843 and int(target_obs_dim) == 847:
+    if int(in_features) == 843 and int(target_obs_dim) in {847, 849, 862}:
         new_w = torch.zeros((out_features, int(target_obs_dim)), dtype=w.dtype)
 
         old = w
@@ -184,8 +184,10 @@ def _adapt_actor_state_dict_for_obs_dim(weights: dict, target_obs_dim: int) -> d
             inv_dst += width
 
         invariant_dim = 571
-        variant_dim = 138
-        last_action_offset_in_variant = 54 + 12
+        # universal_after: 旧=12，新=13；当 target=847 时按 12，其余按 13。
+        universal_dim = 12 if int(target_obs_dim) == 847 else 13
+        variant_dim = 54 + universal_dim + 67 + 5
+        last_action_offset_in_variant = 54 + universal_dim
         for slot in range(2):
             old_slot_start = 709 + slot * 67
             old_slot_end = old_slot_start + 67
@@ -338,16 +340,18 @@ class TorchInProcAgent:
         self.remaining = {0: 27, 1: 27, 2: 27, 3: 27}
         self.over: List[int] = []
 
-        # 观测拆分：
+        # 观测拆分（保持旧特征顺序不变，在尾部追加“剩余牌库结构特征”以便兼容旧权重）：
         # - 不可变状态块（与候选动作无关）：571 维
-        # - 可变块（候选动作会改变的部分）：138 维
-        #   = my_hand_after(54) + universal_after(12) + last_action_after(67) + rel_greater_after(5)
-        # q_network 输入（每个候选动作一行）= invariant + variant = 709 维
-        # actor 输入 = invariant + top2_variant(2*138)
+        # - 可变块（候选动作会改变的部分）：139 维
+        #   = my_hand_after(54) + universal_after(13) + last_action_after(67) + rel_greater_after(5)
+        # - 追加尾部：deck_universal(13)，对所有候选动作相同
+        # q_network 输入（每个候选动作一行）= invariant + variant + deck_universal = 723 维
+        # actor 输入 = invariant + top2_variant(2*139) + deck_universal = 862 维
         self._invariant_dim = 571
-        self._variant_dim = 138
-        actor_obs_dim = int(self._invariant_dim + ACTION_NUMBER * self._variant_dim)
-        q_obs_dim = int(self._invariant_dim + self._variant_dim)
+        self._variant_dim = 139
+        self._deck_universal_dim = 13
+        actor_obs_dim = int(self._invariant_dim + ACTION_NUMBER * self._variant_dim + self._deck_universal_dim)
+        q_obs_dim = int(self._invariant_dim + self._variant_dim + self._deck_universal_dim)
 
         self._actor_obs_dim = int(actor_obs_dim)
         self._q_obs_dim = int(q_obs_dim)
@@ -395,6 +399,112 @@ class TorchInProcAgent:
                 return torch.load(f, map_location='cpu', weights_only=True)
             except TypeError:
                 return torch.load(f, map_location='cpu')
+
+    def export_runtime_state(self) -> Dict[str, Any]:
+        """导出“对局内可变状态”，用于服务端 GUI 撤销回退。
+
+        仅包含与 `prepare()/act_play()/on_notify_play()` 相关的运行时字段，
+        不包含网络权重/优化器等大对象。
+        """
+
+        def _copy_arr(a: Any) -> Any:
+            try:
+                return a.copy()
+            except Exception:
+                return a
+
+        # trajectory/q_trajectory 里包含 numpy 数组，不能只做浅拷贝。
+        traj = []
+        try:
+            for obs, mask, chosen in list(self.trajectory):
+                traj.append((_copy_arr(obs), _copy_arr(mask), int(chosen)))
+        except Exception:
+            traj = []
+
+        q_traj = []
+        try:
+            for xb, chosen_idx in list(self.q_trajectory):
+                q_traj.append((_copy_arr(xb), int(chosen_idx)))
+        except Exception:
+            q_traj = []
+
+        return {
+            "mypos": int(self.mypos),
+            "tribute_result": list(self.tribute_result),
+            "action_seq_detail": [d if d is None else dict(d) for d in list(self.action_seq_detail)],
+            "history_action_detail": {
+                int(k): [d if d is None else dict(d) for d in list(v)] for k, v in dict(self.history_action_detail).items()
+            },
+            "visible_handcards_by_pos": {int(k): _copy_arr(v) for k, v in dict(self.visible_handcards_by_pos).items()},
+            "anti_pos": list(self.anti_pos),
+            "rank": int(self.rank),
+            "oppo_rank": int(self.oppo_rank),
+            "playing_self": int(self.playing_self),
+            "count_A": int(self.count_A),
+            "count_A_self": int(self.count_A_self),
+            "count_A_oppo": int(self.count_A_oppo),
+            "history_action": {int(k): [list(x) for x in list(v)] for k, v in dict(self.history_action).items()},
+            "action_seq": [list(x) for x in list(self.action_seq)],
+            "other_left_hands": list(self.other_left_hands),
+            "flag": int(self.flag),
+            "action_order": list(self.action_order),
+            "remaining": {int(k): int(v) for k, v in dict(self.remaining).items()},
+            "over": list(self.over),
+            "trajectory": traj,
+            "q_trajectory": q_traj,
+        }
+
+    def import_runtime_state(self, state: Dict[str, Any]) -> None:
+        """从 export_runtime_state() 恢复对局内状态。"""
+
+        if not isinstance(state, dict):
+            return
+
+        self.tribute_result = list(state.get("tribute_result", []))
+        self.action_seq_detail = list(state.get("action_seq_detail", []))
+        self.history_action_detail = {int(k): list(v) for k, v in (state.get("history_action_detail", {}) or {}).items()}
+
+        vhp = {}
+        for k, v in (state.get("visible_handcards_by_pos", {}) or {}).items():
+            try:
+                vhp[int(k)] = v.copy()
+            except Exception:
+                vhp[int(k)] = v
+        if vhp:
+            self.visible_handcards_by_pos = vhp
+
+        self.anti_pos = list(state.get("anti_pos", []))
+        self.rank = int(state.get("rank", self.rank))
+        self.oppo_rank = int(state.get("oppo_rank", self.oppo_rank))
+        self.playing_self = int(state.get("playing_self", self.playing_self))
+        self.count_A = int(state.get("count_A", self.count_A))
+        self.count_A_self = int(state.get("count_A_self", self.count_A_self))
+        self.count_A_oppo = int(state.get("count_A_oppo", self.count_A_oppo))
+
+        self.history_action = {int(k): [list(x) for x in list(v)] for k, v in (state.get("history_action", {}) or {}).items()}
+        self.action_seq = [list(x) for x in list(state.get("action_seq", []))]
+        self.other_left_hands = list(state.get("other_left_hands", self.other_left_hands))
+        self.flag = int(state.get("flag", self.flag))
+        self.action_order = list(state.get("action_order", []))
+        self.remaining = {int(k): int(v) for k, v in (state.get("remaining", {}) or {}).items()}
+        self.over = list(state.get("over", []))
+
+        # 轨迹恢复
+        self.trajectory = []
+        for item in list(state.get("trajectory", [])):
+            try:
+                obs, mask, chosen = item
+                self.trajectory.append((obs, mask, int(chosen)))
+            except Exception:
+                pass
+
+        self.q_trajectory = []
+        for item in list(state.get("q_trajectory", [])):
+            try:
+                xb, chosen_idx = item
+                self.q_trajectory.append((xb, int(chosen_idx)))
+            except Exception:
+                pass
 
     def _load_actor_weights(self, path: str):
         weights = self._torch_load_cpu(path)
@@ -699,30 +809,35 @@ class TorchInProcAgent:
             self.over.append(just_play)
 
     def proc_universal(self, my_handcards: np.ndarray, rank: int):
-        """提取 12 维“手牌结构标志”。
+        """提取 13 维“手牌结构标志”。
+
+        新增：最后 1 维为“手牌平均大小”（只按单张大小计算，不考虑牌型）。
 
         该逻辑来自原 torch 客户端（client3.py）并做了最小适配：
         - 输入 my_handcards 是 54 维计数（card2array 输出）
         - rank 是 1..13（2..A），用于定位“参谋(级牌)”的位置并在统计时排除。
         """
 
-        res = np.zeros(12, dtype=np.int8)
+        res = np.zeros(13, dtype=np.int8)
 
         cur_rank = int(rank)
         if cur_rank < 1 or cur_rank > 13:
             return res
 
-        # 如果手里没有“参谋(级牌)”（非红心参谋），则直接返回全 0。
+        # 是否有“参谋(级牌)”：用于 res[0] 标志位，并影响 rock_flag 的判定阈值。
         # 注意：这里沿用原实现对“级牌位置”的假设：rank 对应 (rank-1)*4 这一组。
+        has_advisor = False
         try:
-            if int(my_handcards[(cur_rank - 1) * 4]) == 0:
-                return res
+            has_advisor = int(my_handcards[(cur_rank - 1) * 4]) > 0
         except Exception:
-            return res
+            has_advisor = False
 
-        res[0] = 1
+        res[0] = 1 if has_advisor else 0
 
-        # rock_flag：是否存在“杂顺子(连续5张以内，最多缺1张)”的形态（排除级牌位）。
+        # rock_flag：是否存在“同花色窗口 5 连”的形态（排除级牌位）。
+        # - 有参谋时：允许“差一张就五连”（最多缺 1 张）
+        # - 无参谋时：不考虑“差一张就五连”，仅认可“完整五连”（缺 0 张）
+        allow_missing = 1 if has_advisor else 0
         rock_flag = 0
         for i in range(4):
             left, right = 0, 5
@@ -732,7 +847,7 @@ class TorchInProcAgent:
             ]
             while right <= 12:
                 zero_num = temp.count(0)
-                if zero_num <= 1:
+                if zero_num <= allow_missing:
                     rock_flag = 1
                     break
                 temp.append(int(my_handcards[i + right * 4]) if (i + right * 4) != (cur_rank - 1) * 4 else 0)
@@ -789,6 +904,46 @@ class TorchInProcAgent:
         if temp_run >= 4:
             res[8] = 1
 
+        # 额外：手牌平均大小（单张大小，不考虑牌型）。
+        # 取整后放入最后一维；范围大致在 [2..17]（含级牌与大小王）。
+        try:
+            # 普通牌（0..51）：idx = suit + rank_idx*4，其中 rank_idx 0..12 对应 2..A。
+            total = 0
+            total_value = 0
+            cur_rank_idx = int(cur_rank) - 1  # 0..12
+            for ridx in range(13):
+                # 该点数在四花色上的总数（每张计 1；两副牌时每个具体牌最多 2）
+                cnt = 0
+                base = ridx * 4
+                for s in range(4):
+                    cnt += int(my_handcards[base + s])
+                if cnt <= 0:
+                    continue
+                # 基础大小：2..A => 2..14；级牌特殊设为 15（比 A 大）
+                v = 15 if ridx == cur_rank_idx else int(ridx + 2)
+                total += cnt
+                total_value += int(v * cnt)
+
+            # 小王/大王（52/53）：按 B=16, R=17。
+            sb = int(my_handcards[52]) if int(len(my_handcards)) > 52 else 0
+            hr = int(my_handcards[53]) if int(len(my_handcards)) > 53 else 0
+            if sb > 0:
+                total += sb
+                total_value += int(16 * sb)
+            if hr > 0:
+                total += hr
+                total_value += int(17 * hr)
+
+            avg = int(round(float(total_value) / float(total))) if total > 0 else 0
+            # 防止 int8 溢出/异常值
+            if avg < 0:
+                avg = 0
+            if avg > 30:
+                avg = 30
+            res[12] = np.int8(avg)
+        except Exception:
+            res[12] = np.int8(0)
+
         return res
 
     def prepare(self, message: Dict[str, Any]) -> Dict[str, Any]:
@@ -819,7 +974,7 @@ class TorchInProcAgent:
         # 对每个候选动作生成“采取动作后”的手牌与其派生结构特征（统计量也要同步更新）。
         cur_rank_i = RANK[str(message['curRank'])]
         my_hand_after_batch = np.repeat(my_handcards[np.newaxis, :], num_legal_actions, axis=0)
-        universal_after_batch = np.zeros((num_legal_actions, 12), dtype=np.int8)
+        universal_after_batch = np.zeros((num_legal_actions, 13), dtype=np.int8)
         for j, (t, real_cards) in enumerate(zip(legal_actions_type, legal_actions_real)):
             if str(t).upper() != 'PASS':
                 played = card2array(real_cards)
@@ -840,6 +995,10 @@ class TorchInProcAgent:
                 other_hands.append(i)
                 other_hands.append(i)
         other_handcards = card2array(other_hands)
+
+        # 当前剩余牌库（不在自己手上、尚未被打出的牌）结构特征：用同一套算法计算。
+        # 注意：为兼容旧权重，这 13 维作为“尾部追加特征”，不插入 invariant/variant 中间。
+        deck_universal = self.proc_universal(other_handcards, cur_rank_i)
 
         if len(self.action_seq) > 0:
             last_action_54 = card2array(self.action_seq[-1])
@@ -966,14 +1125,17 @@ class TorchInProcAgent:
         # 可变块（候选动作会改变的部分）：用于 actor 的“动作特征区”。
         variant_batch = np.hstack((my_hand_after_batch, universal_after_batch, last_action_batch, rel_greater_after_batch))
 
-        # q_network 的每行输入：invariant + variant（候选动作的后继局面）
-        x_batch = np.hstack((invariant_batch, variant_batch))
+        deck_universal_batch = np.repeat(deck_universal[np.newaxis, :], num_legal_actions, axis=0).astype(np.int8)
+
+        # q_network 的每行输入：invariant + variant（候选动作的后继局面）+ deck_universal(尾部)
+        x_batch = np.hstack((invariant_batch, variant_batch, deck_universal_batch))
         # actor 的状态输入：只保留 invariant（不随候选动作变化）
         x_no_action = invariant.astype(np.float32, copy=False)
 
         return {
             'x_batch': x_batch.astype(np.int8),
             'x_no_action': x_no_action.astype(np.float32),
+            'deck_universal': deck_universal.astype(np.float32, copy=False),
         }
 
     def build_obs_for_message(self, message: Dict[str, Any]) -> Tuple[np.ndarray, np.ndarray, List[int]]:
@@ -992,6 +1154,9 @@ class TorchInProcAgent:
         state = self.prepare(message)
         states = state['x_batch']
         state_no_action = state['x_no_action']
+        deck_universal = state.get('deck_universal')
+        if deck_universal is None:
+            deck_universal = np.zeros((13,), dtype=np.float32)
 
         legal_action = 2
         legal_index = np.ones(legal_action, dtype=np.float32)
@@ -1000,8 +1165,8 @@ class TorchInProcAgent:
             indexs = self.player.model_q.get_max_n_index(states, legal_action)
             dqn_states = np.asarray(states[indexs])
             # actor 的“动作特征区”：只拼接会随候选动作改变的那部分（variant）。
-            top_variants = dqn_states[:, self._invariant_dim :].reshape(-1)
-            obs_vec = np.concatenate((state_no_action, top_variants))
+            top_variants = dqn_states[:, self._invariant_dim : self._invariant_dim + self._variant_dim].reshape(-1)
+            obs_vec = np.concatenate((state_no_action, top_variants, deck_universal))
             return obs_vec.astype(np.float32), legal_index.astype(np.float32), list(map(int, indexs))
 
         legal_action = len(states)
@@ -1010,10 +1175,10 @@ class TorchInProcAgent:
         indexs = list(range(2))
         top_indexs = self.player.model_q.get_max_n_index(states, 2)
         dqn_states = np.asarray(states[top_indexs])
-        top_variants = dqn_states[:, self._invariant_dim :].reshape(-1)
-        obs_vec = np.concatenate((state_no_action, top_variants))
         supple = np.zeros(int(self._variant_dim) * (2 - legal_action), dtype=np.float32)
-        obs_vec = np.concatenate((obs_vec, supple))
+        top_variants = dqn_states[:, self._invariant_dim : self._invariant_dim + self._variant_dim].reshape(-1)
+        obs_prefix = np.concatenate((state_no_action, top_variants, supple))
+        obs_vec = np.concatenate((obs_prefix, deck_universal))
         return obs_vec.astype(np.float32), legal_index.astype(np.float32), indexs
 
     def build_obs_for_message_with_candidates(
@@ -1028,7 +1193,7 @@ class TorchInProcAgent:
         用于离线回放/训练时复现“TopK候选动作特征拼接”的输入格式，同时允许
         将某个“指定动作”（例如人类真实选择）强制拼进候选集。
 
-        - obs_vec 形状：invariant(571) + action_number * variant(138)
+        - obs_vec 形状：invariant(571) + action_number * variant(139) + deck_universal(13)
         - legal_mask 形状：(action_number,)，无效槽位为 0。
         """
 
@@ -1041,6 +1206,9 @@ class TorchInProcAgent:
         state = self.prepare(message)
         states = state['x_batch']
         state_no_action = state['x_no_action']
+        deck_universal = state.get('deck_universal')
+        if deck_universal is None:
+            deck_universal = np.zeros((13,), dtype=np.float32)
 
         k = int(action_number)
         if k <= 0:
@@ -1070,10 +1238,14 @@ class TorchInProcAgent:
 
             used.append(idx)
             legal_mask[slot] = 1.0
-            v = states[idx, int(self._invariant_dim) :].astype(np.float32, copy=False)
+            v = states[idx, int(self._invariant_dim) : int(self._invariant_dim + self._variant_dim)].astype(
+                np.float32, copy=False
+            )
             variants.append(v)
 
-        obs_vec = np.concatenate([state_no_action.astype(np.float32, copy=False)] + variants)
+        obs_vec = np.concatenate(
+            [state_no_action.astype(np.float32, copy=False)] + variants + [deck_universal.astype(np.float32, copy=False)]
+        )
         return obs_vec.astype(np.float32), legal_mask.astype(np.float32)
 
     def act_play(self, message: Dict[str, Any]) -> int:
@@ -1106,22 +1278,25 @@ class TorchInProcAgent:
         legal_action = 2
         legal_index = np.ones(legal_action, dtype=np.float32)
         state_no_action = state['x_no_action']
+        deck_universal = state.get('deck_universal')
+        if deck_universal is None:
+            deck_universal = np.zeros((13,), dtype=np.float32)
 
         if len(states) >= legal_action:
             indexs = self.player.model_q.get_max_n_index(states, legal_action)
             dqn_states = np.asarray(states[indexs])
-            top_variants = dqn_states[:, self._invariant_dim :].reshape(-1)
-            obs_vec = np.concatenate((state_no_action, top_variants))
+            top_variants = dqn_states[:, self._invariant_dim : self._invariant_dim + self._variant_dim].reshape(-1)
+            obs_vec = np.concatenate((state_no_action, top_variants, deck_universal))
         else:
             legal_action = len(states)
             legal_index[legal_action:] = 0.0
             indexs = list(range(2))
             top_indexs = self.player.model_q.get_max_n_index(states, 2)
             dqn_states = np.asarray(states[top_indexs])
-            top_variants = dqn_states[:, self._invariant_dim :].reshape(-1)
-            obs_vec = np.concatenate((state_no_action, top_variants))
             supple = np.zeros(int(self._variant_dim) * (2 - legal_action), dtype=np.float32)
-            obs_vec = np.concatenate((obs_vec, supple))
+            top_variants = dqn_states[:, self._invariant_dim : self._invariant_dim + self._variant_dim].reshape(-1)
+            obs_prefix = np.concatenate((state_no_action, top_variants, supple))
+            obs_vec = np.concatenate((obs_prefix, deck_universal))
 
         chosen = int(self.player.model.step(obs_vec, legal_index))
         if record:

@@ -106,6 +106,11 @@ class _GuiFallbackToTerminalThisTurn(Exception):
   pass
 
 
+class _GuiUndoToPreviousHumanAction(Exception):
+  """GUI 请求：回退到上一个人类玩家动作之前的局面。"""
+
+
+
 def format_card_for_human(card: Card) -> str:
   suit_symbol = {"C": "♣", "D": "♦", "S": "♠", "H": "♥"}
   rank_display = {"T": "10"}
@@ -526,6 +531,7 @@ class _PersistentHumanActionPicker:
     self._result_action: Optional[Action] = None
     self._result_ai_hand: Optional[str] = None
     self._closed_for_turn = False
+    self._undo_prev_human = False
 
     self._max_w = 0
     self._max_h = 0
@@ -732,6 +738,12 @@ class _PersistentHumanActionPicker:
     self.selected.clear()
     self.selected_count.clear()
 
+  def _preview_has_any_cards(self) -> bool:
+    try:
+      return bool(self.selected)
+    except Exception:
+      return False
+
   def _refresh_ui(self):
     # 标题与上下文
     try:
@@ -846,13 +858,21 @@ class _PersistentHumanActionPicker:
     self._refresh_ui()
 
   def _on_undo(self):
-    if not self.selected:
+    # 需求：
+    # - 预览区有牌：清空所有已选牌。
+    # - 预览区无牌：回退到“上一个人类玩家动作之前”的局面，令其重新选择动作。
+    if self._preview_has_any_cards():
+      self._clear_selection()
+      self._refresh_ui()
       return
-    last = self.selected.pop()
-    self.selected_count[last] -= 1
-    if self.selected_count[last] <= 0:
-      del self.selected_count[last]
-    self._refresh_ui()
+
+    if self._mode == "human":
+      self._undo_prev_human = True
+      self._done_var.set(1)
+      return
+
+    # ai_hand/idle 模式下，预览为空则不做任何事。
+    return
 
   def _on_detect_from_screen(self):
     from tkinter import messagebox
@@ -1089,6 +1109,7 @@ class _PersistentHumanActionPicker:
     self._result_action = None
     self._result_ai_hand = None
     self._closed_for_turn = False
+    self._undo_prev_human = False
 
     self._clear_selection()
     self._refresh_ui()
@@ -1102,6 +1123,11 @@ class _PersistentHumanActionPicker:
     except Exception:
       pass
     self.root.wait_variable(self._done_var)
+
+    if getattr(self, "_undo_prev_human", False):
+      self._undo_prev_human = False
+      self._idle()
+      raise _GuiUndoToPreviousHumanAction()
 
     if self._closed_for_turn:
       # 本回合回退到终端输入。
@@ -1455,9 +1481,17 @@ def _resolve_action_with_adviser(
 
 
 def rank_value(rank_char: str, cur_rank: str) -> int:
-  if rank_char == cur_rank:
+  r = str(rank_char or "").strip().upper()
+  if not r:
+    return 0
+  if r == str(cur_rank or "").strip().upper():
     return 15
-  return BASE_RANK_VALUE[rank_char]
+  # 兼容 JokerBomb 的 key='JOKER'，以及大小王标识。
+  if r in {"JOKER", "HR", "SB"}:
+    return 20
+  if r in {"R", "B"}:
+    return int(BASE_RANK_VALUE.get(r, 18))
+  return int(BASE_RANK_VALUE.get(r, 0))
 
 
 def make_double_deck() -> List[Card]:
@@ -2133,12 +2167,72 @@ class MiniDanServer:
     self.finish_order: List[int] = []
     self._finished: set[int] = set()
 
+    # 人类“撤销到上一个人类动作前”的快照栈（仅 inproc 模式可靠）。
+    self._human_undo_stack: List[Dict[str, Any]] = []
+
   def _mark_finished(self, seat: int):
     s = int(seat)
     if s in self._finished:
       return
     self._finished.add(s)
     self.finish_order.append(s)
+
+  def _make_human_undo_snapshot(self) -> Dict[str, Any]:
+    """保存一份“应用某个人类动作之前”的快照。
+
+    仅用于 inproc 模式：因为 websockets/外部客户端无法被回退同步。
+    """
+
+    agent_state = None
+    try:
+      ag = self.seat0_inproc_agent
+      if ag is not None and hasattr(ag, "export_runtime_state"):
+        agent_state = ag.export_runtime_state()
+    except Exception:
+      agent_state = None
+
+    return {
+      "ai_hand": list(self.ai_hand),
+      "played_cards": Counter(self.played_cards),
+      "human_remaining": dict(self.human_remaining),
+      "play_history": list(self.play_history),
+      "played_by_seat": {k: list(v) for k, v in (self.played_by_seat or {}).items()},
+      "current_pos": int(self.current_pos),
+      "greater_action": self.greater_action,
+      "greater_pos": self.greater_pos,
+      "passes_since_play": int(self.passes_since_play),
+      "finish_order": list(self.finish_order),
+      "finished": set(self._finished),
+      "end_reason": self.end_reason,
+      "agent_state": agent_state,
+    }
+
+  def _restore_from_human_undo_snapshot(self, snap: Dict[str, Any]) -> None:
+    """从快照恢复状态，并使游戏回到对应的人类动作前。"""
+    self.ai_hand = list(snap.get("ai_hand", []))
+    self.played_cards = Counter(snap.get("played_cards", Counter()))
+    self.human_remaining = dict(snap.get("human_remaining", {}))
+    self.play_history = list(snap.get("play_history", []))
+    self.played_by_seat = {k: list(v) for k, v in (snap.get("played_by_seat", {}) or {}).items()}
+    self.current_pos = int(snap.get("current_pos", 0))
+    self.greater_action = snap.get("greater_action", None)
+    self.greater_pos = snap.get("greater_pos", None)
+    self.passes_since_play = int(snap.get("passes_since_play", 0))
+    self.finish_order = list(snap.get("finish_order", []))
+    self._finished = set(snap.get("finished", set()))
+    self.end_reason = snap.get("end_reason", None)
+
+    # 恢复 inproc agent 的对局内状态（不影响网络权重）。
+    try:
+      ag = self.seat0_inproc_agent
+      st = snap.get("agent_state", None)
+      if ag is not None and st is not None and hasattr(ag, "import_runtime_state"):
+        ag.import_runtime_state(st)
+    except Exception:
+      pass
+
+    # 回退后清空上一次 act 请求缓存，避免误导排障。
+    self._last_seat0_act_meta = None
 
   async def register(self, seat: int, ws: ServerConnection):
     self.seat_conns[seat] = SeatConn(seat=seat, ws=ws)
@@ -2222,11 +2316,40 @@ class MiniDanServer:
     self.end_reason = None
     self.finish_order = []
     self._finished = set()
+    self._human_undo_stack = []
 
   def prompt_human_action(self, seat: int) -> Action:
+    def _print_turn_prompt() -> None:
+      try:
+        s = int(seat)
+      except Exception:
+        s = seat  # type: ignore
+      try:
+        remaining = int(self.human_remaining.get(int(seat), 27))
+      except Exception:
+        remaining = self.human_remaining.get(seat, 27)  # type: ignore
+
+      if self.greater_action is None:
+        print(f"[turn] 轮到 Seat{seat} 决策：先手出牌（剩余 {remaining} 张）", flush=True)
+        return
+
+      gp = self.greater_pos
+      gp_s = f"Seat{gp}" if isinstance(gp, int) and 0 <= gp < 4 else "未知"
+      try:
+        cur = format_action_for_human(self.greater_action, self.cur_rank)
+      except Exception:
+        cur = str(self.greater_action)
+      print(
+        f"[turn] 轮到 Seat{seat} 决策：跟牌/可 PASS（剩余 {remaining} 张）；当前最大牌={cur}（出牌者 {gp_s}）",
+        flush=True,
+      )
+
     # 优先使用 GUI 选牌。
     try:
       import tkinter  # noqa: F401
+
+      # GUI 等待用户操作期间，终端也要给出清晰提示。
+      _print_turn_prompt()
 
       act = _pick_human_action_gui(
         seat=seat,
@@ -2237,6 +2360,9 @@ class MiniDanServer:
         greater_action=self.greater_action,
       )
       return act
+    except _GuiUndoToPreviousHumanAction:
+      # GUI 请求回退：让主循环处理恢复快照并重新进入出牌选择。
+      return ["UNDO_HUMAN", "UNDO_HUMAN", []]
     except _GuiFallbackToTerminalThisTurn:
       # 本回合用户关闭窗口，回退到终端输入。
       pass
@@ -2528,8 +2654,32 @@ class MiniDanServer:
           stopped_early = True
           break
 
+        # 人类撤销：回退到上一个“人类动作之前”的局面，并让其重新选择。
+        if isinstance(act, list) and len(act) >= 1 and str(act[0]).upper() == "UNDO_HUMAN":
+          if self.seat0_inproc_agent is None:
+            print("当前不是 inproc 模式：撤销回退可能导致客户端不同步，已忽略。")
+            continue
+          if not getattr(self, "_human_undo_stack", None):
+            print("没有可撤销的人类动作（已到开局）。")
+            continue
+          snap = self._human_undo_stack.pop()
+          try:
+            self._restore_from_human_undo_snapshot(snap)
+            print("已回退到上一个人类动作前，请重新选择。")
+          except Exception as e:
+            _log_exception("[server] undo restore failed: ", e)
+          continue
+
         if act and isinstance(act, list) and act[0] == "RESTART_FULL":
           return "restart_full"
+
+        # 在应用人类动作前保存快照（包括 PASS），支持 GUI 撤销回退。
+        if self.seat0_inproc_agent is not None:
+          try:
+            self._human_undo_stack.append(self._make_human_undo_snapshot())
+          except Exception:
+            pass
+
         if act[0] != "PASS":
           self.human_remaining[self.current_pos] = max(
             0, self.human_remaining.get(self.current_pos, 27) - len(act[2])
