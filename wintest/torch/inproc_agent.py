@@ -29,6 +29,12 @@ RANK = {
 
 ACTION_NUMBER = 2
 
+# proc_universal 输出维度：
+# - 12 维手牌结构标志（兼容原 torch 客户端）
+# - 8 维：按同点数张数(1..8)分类的“平均大小”
+# - 6 维：单顺/双顺/三顺的“最长连顺窗口”(长度+平均大小)
+UNIVERSAL_DIM = 26
+
 
 _RANKS_13 = ['2', '3', '4', '5', '6', '7', '8', '9', 'T', 'J', 'Q', 'K', 'A']
 
@@ -126,11 +132,13 @@ class _CPU_Unpickler(pickle.Unpickler):
 
 
 def _adapt_actor_state_dict_for_obs_dim(weights: dict, target_obs_dim: int) -> dict:
-    """兼容加载旧版权重。
+    """兼容加载 actor 权重（仅支持最新与次新观测维度）。
 
-    - 观测维度扩展：对第一层输入权重右侧补 0
-    - 观测维度缩小：对第一层输入权重做截断
-    - 特殊兼容：旧 actor(843维) -> 新 actor(847/849/862维) 的“有意义映射”
+    支持的 actor 观测维度：
+    - 最新：904（invariant=574）
+    - 次新：901（invariant=571）
+
+    更老版本（如 843/849/847 等）不再兼容：发现后直接报错，避免“加载成功但语义错位”。
     """
 
     if not isinstance(weights, dict):
@@ -148,56 +156,13 @@ def _adapt_actor_state_dict_for_obs_dim(weights: dict, target_obs_dim: int) -> d
     if in_features == int(target_obs_dim):
         return weights
 
-    # 旧版本 actor 输入（843）= x_no_action(709, 动作前全状态) + top2_action(2*67)
-    # 新版本 actor 输入（849/862）= invariant(571, 与候选无关) + top2_variant(2*139) + deck_universal(13)
-    #   其中每个 variant = my_hand_after(54) + universal_after(13) + last_action_after(67) + rel_greater_after(5)
-    # 由于语义变化，无法完全等价映射；这里做一个尽量“对齐不变信息”的映射：
-    # - invariant：从旧的 x_no_action 中抽取对应子段
-    # - 每个槽位的 last_action_after(67)：复用旧 top_action(67) 的权重
-    # 其余新增维度默认置 0。
-    if int(in_features) == 843 and int(target_obs_dim) in {847, 849, 862}:
-        new_w = torch.zeros((out_features, int(target_obs_dim)), dtype=w.dtype)
-
-        old = w
-        inv_src_slices = [
-            (66, 120),   # other_hand 54
-            (187, 254),  # last_teammate_action 67
-            (254, 308),  # down_played 54
-            (308, 362),  # teammate_played 54
-            (362, 416),  # up_played 54
-            (416, 444),  # down_num_left 28
-            (444, 472),  # teammate_num_left 28
-            (472, 500),  # up_num_left 28
-            (500, 513),  # self_rank 13
-            (513, 526),  # oppo_rank 13
-            (526, 539),  # cur_rank 13
-            (544, 598),  # down_known 54
-            (598, 652),  # teammate_known 54
-            (652, 706),  # up_known 54
-            (706, 709),  # counts 3
-        ]
-
-        inv_dst = 0
-        for s, e in inv_src_slices:
-            width = int(e - s)
-            new_w[:, inv_dst : inv_dst + width] = old[:, s:e]
-            inv_dst += width
-
-        invariant_dim = 571
-        # universal_after: 旧=12，新=13；当 target=847 时按 12，其余按 13。
-        universal_dim = 12 if int(target_obs_dim) == 847 else 13
-        variant_dim = 54 + universal_dim + 67 + 5
-        last_action_offset_in_variant = 54 + universal_dim
-        for slot in range(2):
-            old_slot_start = 709 + slot * 67
-            old_slot_end = old_slot_start + 67
-            new_slot_start = invariant_dim + slot * variant_dim
-            new_last_action_start = new_slot_start + last_action_offset_in_variant
-            new_last_action_end = new_last_action_start + 67
-            new_w[:, new_last_action_start:new_last_action_end] = old[:, old_slot_start:old_slot_end]
-
-        weights[wkey] = new_w
-        return weights
+    supported = {901, 904}
+    if int(target_obs_dim) not in supported:
+        raise ValueError(f"unsupported target actor obs_dim={int(target_obs_dim)}; supported={sorted(supported)}")
+    if int(in_features) not in supported:
+        raise ValueError(
+            f"unsupported saved actor obs_dim={int(in_features)} (first layer '{wkey}'); supported={sorted(supported)}"
+        )
 
     if in_features > int(target_obs_dim):
         weights[wkey] = w[:, : int(target_obs_dim)].contiguous()
@@ -210,7 +175,14 @@ def _adapt_actor_state_dict_for_obs_dim(weights: dict, target_obs_dim: int) -> d
 
 
 def _adapt_q_state_dict_for_obs_dim(weights: dict, target_obs_dim: int) -> dict:
-    """兼容加载旧版 q_network 权重：当观测维度扩展时，把第一层输入权重右侧补 0。"""
+    """兼容加载 q_network 权重（仅支持最新与次新观测维度）。
+
+    支持的 q 观测维度：
+    - 最新：752（invariant=574）
+    - 次新：749（invariant=571）
+
+    更老版本不再兼容。
+    """
 
     if not isinstance(weights, dict):
         return weights
@@ -226,6 +198,14 @@ def _adapt_q_state_dict_for_obs_dim(weights: dict, target_obs_dim: int) -> dict:
     out_features, in_features = int(w.shape[0]), int(w.shape[1])
     if in_features == int(target_obs_dim):
         return weights
+
+    supported = {749, 752}
+    if int(target_obs_dim) not in supported:
+        raise ValueError(f"unsupported target q obs_dim={int(target_obs_dim)}; supported={sorted(supported)}")
+    if int(in_features) not in supported:
+        raise ValueError(
+            f"unsupported saved q obs_dim={int(in_features)} (first layer '{wkey}'); supported={sorted(supported)}"
+        )
     if in_features > int(target_obs_dim):
         # 观测维度缩小：对第一层权重做截断。
         weights[wkey] = w[:, : int(target_obs_dim)].contiguous()
@@ -249,10 +229,7 @@ class _InProcPlayer:
         if model_path.exists():
             with model_path.open('rb') as f:
                 new_weights = _CPU_Unpickler(f).load()
-            try:
-                new_weights = _adapt_actor_state_dict_for_obs_dim(new_weights, int(actor_obs_dim))
-            except Exception:
-                pass
+            new_weights = _adapt_actor_state_dict_for_obs_dim(new_weights, int(actor_obs_dim))
             self.model.set_weights(new_weights)
 
         self.model_q = MLPQNetwork(int(q_obs_dim))
@@ -341,15 +318,16 @@ class TorchInProcAgent:
         self.over: List[int] = []
 
         # 观测拆分（保持旧特征顺序不变，在尾部追加“剩余牌库结构特征”以便兼容旧权重）：
-        # - 不可变状态块（与候选动作无关）：571 维
-        # - 可变块（候选动作会改变的部分）：139 维
-        #   = my_hand_after(54) + universal_after(13) + last_action_after(67) + rel_greater_after(5)
-        # - 追加尾部：deck_universal(13)，对所有候选动作相同
-        # q_network 输入（每个候选动作一行）= invariant + variant + deck_universal = 723 维
-        # actor 输入 = invariant + top2_variant(2*139) + deck_universal = 862 维
-        self._invariant_dim = 571
-        self._variant_dim = 139
-        self._deck_universal_dim = 13
+        # - 不可变状态块（与候选动作无关）：574 维
+        # - 可变块（候选动作会改变的部分）：152 维
+        #   = my_hand_after(54) + universal_after(26) + last_action_after(67) + rel_greater_after(5)
+        # - 追加尾部：deck_universal(26)，对所有候选动作相同
+        # 额外不变特征：贡牌目标（上家/队友/下家）3 维
+        # q_network 输入（每个候选动作一行）= invariant + variant + deck_universal = 752 维
+        # actor 输入 = invariant + top2_variant(2*152) + deck_universal = 904 维
+        self._invariant_dim = 574
+        self._variant_dim = 54 + UNIVERSAL_DIM + 67 + 5
+        self._deck_universal_dim = UNIVERSAL_DIM
         actor_obs_dim = int(self._invariant_dim + ACTION_NUMBER * self._variant_dim + self._deck_universal_dim)
         q_obs_dim = int(self._invariant_dim + self._variant_dim + self._deck_universal_dim)
 
@@ -375,15 +353,12 @@ class TorchInProcAgent:
                 qw = self._torch_load_cpu(q_weights_override_path)
                 if not isinstance(qw, dict):
                     raise TypeError(f"unexpected q weights type: {type(qw).__name__}")
-                try:
-                    qw = _adapt_q_state_dict_for_obs_dim(qw, int(q_obs_dim))
-                except Exception:
-                    pass
+                qw = _adapt_q_state_dict_for_obs_dim(qw, int(q_obs_dim))
                 self.player.model_q.load_state_dict(qw)
                 print(f"[inproc] loaded q_network weights: {q_weights_override_path}")
-            except Exception:
-                # q 权重缺失/损坏时不影响运行：回退使用仓库自带的默认权重文件（q_network.ckpt）。
-                pass
+            except Exception as e:
+                # q 权重缺失/损坏/维度不兼容时不影响运行：回退使用仓库自带的默认权重文件（q_network.ckpt）。
+                print(f"[inproc] skip q override (will use default q_network.ckpt): {e}")
 
         # 策略梯度（PPO）轨迹缓存：[(观测向量, 合法动作掩码, 选择的动作编号), ...]
         # 动作编号的范围是 [0, ActionNumber)。
@@ -510,10 +485,7 @@ class TorchInProcAgent:
         weights = self._torch_load_cpu(path)
         if not isinstance(weights, dict):
             raise TypeError(f"unexpected weights type: {type(weights).__name__}")
-        try:
-            weights = _adapt_actor_state_dict_for_obs_dim(weights, int(self._actor_obs_dim))
-        except Exception:
-            pass
+        weights = _adapt_actor_state_dict_for_obs_dim(weights, int(self._actor_obs_dim))
         self.player.model.set_weights(weights)
 
     def save_actor_weights(self, path: str):
@@ -808,17 +780,23 @@ class TorchInProcAgent:
         if self.remaining[just_play] == 0 and just_play not in self.over:
             self.over.append(just_play)
 
+        return
+
     def proc_universal(self, my_handcards: np.ndarray, rank: int):
-        """提取 13 维“手牌结构标志”。
+        """提取 26 维“手牌结构/统计特征”。
 
-        新增：最后 1 维为“手牌平均大小”（只按单张大小计算，不考虑牌型）。
+        结构标志（前 12 维）：兼容原 torch 客户端的 proc_universal。
 
-        该逻辑来自原 torch 客户端（client3.py）并做了最小适配：
-        - 输入 my_handcards 是 54 维计数（card2array 输出）
+        新增统计：
+        - 8 维“平均大小”：按同点数张数 g=1..8 分类统计平均大小；该类没有牌则为 0。
+          （大小映射：2..A => 2..14；参谋(级牌) => 15；SB/HR => 16/17）
+        - 6 维“最长连顺窗口”：单顺/双顺/三顺分别给出 (长度, 平均大小)。
+          允许缺 1 张当且仅当手里有参谋（参谋视为万能补缺）。
+
         - rank 是 1..13（2..A），用于定位“参谋(级牌)”的位置并在统计时排除。
         """
 
-        res = np.zeros(13, dtype=np.int8)
+        res = np.zeros(UNIVERSAL_DIM, dtype=np.int8)
 
         cur_rank = int(rank)
         if cur_rank < 1 or cur_rank > 13:
@@ -832,6 +810,7 @@ class TorchInProcAgent:
         except Exception:
             has_advisor = False
 
+        # legacy flags (0..11)
         res[0] = 1 if has_advisor else 0
 
         # rock_flag：是否存在“同花色窗口 5 连”的形态（排除级牌位）。
@@ -904,45 +883,106 @@ class TorchInProcAgent:
         if temp_run >= 4:
             res[8] = 1
 
-        # 额外：手牌平均大小（单张大小，不考虑牌型）。
-        # 取整后放入最后一维；范围大致在 [2..17]（含级牌与大小王）。
+        # 新增统计特征
         try:
-            # 普通牌（0..51）：idx = suit + rank_idx*4，其中 rank_idx 0..12 对应 2..A。
-            total = 0
-            total_value = 0
             cur_rank_idx = int(cur_rank) - 1  # 0..12
+
+            # 统计每个点数的总张数（四花色求和；两副牌时每个花色槽位 0..2）
+            totals_full = [0] * 13
             for ridx in range(13):
-                # 该点数在四花色上的总数（每张计 1；两副牌时每个具体牌最多 2）
-                cnt = 0
                 base = ridx * 4
+                cnt = 0
                 for s in range(4):
                     cnt += int(my_handcards[base + s])
-                if cnt <= 0:
-                    continue
-                # 基础大小：2..A => 2..14；级牌特殊设为 15（比 A 大）
-                v = 15 if ridx == cur_rank_idx else int(ridx + 2)
-                total += cnt
-                total_value += int(v * cnt)
+                totals_full[ridx] = int(cnt)
 
-            # 小王/大王（52/53）：按 B=16, R=17。
             sb = int(my_handcards[52]) if int(len(my_handcards)) > 52 else 0
             hr = int(my_handcards[53]) if int(len(my_handcards)) > 53 else 0
-            if sb > 0:
-                total += sb
-                total_value += int(16 * sb)
-            if hr > 0:
-                total += hr
-                total_value += int(17 * hr)
 
-            avg = int(round(float(total_value) / float(total))) if total > 0 else 0
-            # 防止 int8 溢出/异常值
-            if avg < 0:
-                avg = 0
-            if avg > 30:
-                avg = 30
-            res[12] = np.int8(avg)
+            # (1) 按同点数张数 g=1..8 分类的“平均大小”
+            for g in range(1, 9):
+                s_val = 0
+                n_val = 0
+                for ridx in range(13):
+                    if int(totals_full[ridx]) != int(g):
+                        continue
+                    v = 15 if ridx == cur_rank_idx else int(ridx + 2)
+                    s_val += int(v)
+                    n_val += 1
+                if int(sb) == int(g):
+                    s_val += 16
+                    n_val += 1
+                if int(hr) == int(g):
+                    s_val += 17
+                    n_val += 1
+                avg_g = int(round(float(s_val) / float(n_val))) if n_val > 0 else 0
+                if avg_g < 0:
+                    avg_g = 0
+                if avg_g > 30:
+                    avg_g = 30
+                res[12 + (g - 1)] = np.int8(avg_g)
+
+            # (2) 最长连顺窗口：单顺/双顺/三顺，各输出(长度, 平均大小)
+            advisor_cnt = int(totals_full[cur_rank_idx]) if 0 <= cur_rank_idx < 13 else 0
+            allow_missing_seq = 1 if advisor_cnt > 0 else 0
+
+            # 连顺检测不把“参谋(级牌)”当作自身点数，参谋仅用于补缺。
+            totals_no_advisor = list(totals_full)
+            if 0 <= cur_rank_idx < 13:
+                totals_no_advisor[cur_rank_idx] = 0
+
+            def _best_seq_stats(k: int) -> Tuple[int, int]:
+                present = [1 if int(totals_no_advisor[i]) >= int(k) else 0 for i in range(13)]
+                m = int(allow_missing_seq)
+
+                p2 = present + present
+                left = 0
+                zeros = 0
+                best_len = 0
+                best_start = 0
+                for right in range(len(p2)):
+                    if int(p2[right]) == 0:
+                        zeros += 1
+                    while zeros > m or (right - left + 1) > 13:
+                        if int(p2[left]) == 0:
+                            zeros -= 1
+                        left += 1
+                    if left >= 13:
+                        break
+                    cur_len = int(right - left + 1)
+                    if cur_len > best_len:
+                        best_len = cur_len
+                        best_start = left
+                    elif cur_len == best_len and cur_len > 0:
+                        # tie-break：更大平均大小优先
+                        s1 = 0
+                        s2 = 0
+                        for t in range(cur_len):
+                            s1 += int((best_start + t) % 13) + 2
+                            s2 += int((left + t) % 13) + 2
+                        if s2 > s1:
+                            best_start = left
+
+                if best_len <= 0:
+                    return 0, 0
+
+                total_v = 0
+                for t in range(best_len):
+                    total_v += int((best_start + t) % 13) + 2
+                avg_v = int(round(float(total_v) / float(best_len))) if best_len > 0 else 0
+                if avg_v < 0:
+                    avg_v = 0
+                if avg_v > 30:
+                    avg_v = 30
+                return int(best_len), int(avg_v)
+
+            for idx, k in enumerate((1, 2, 3)):
+                l, a = _best_seq_stats(int(k))
+                res[20 + idx * 2] = np.int8(min(30, max(0, int(l))))
+                res[21 + idx * 2] = np.int8(min(30, max(0, int(a))))
         except Exception:
-            res[12] = np.int8(0)
+            for i in range(12, UNIVERSAL_DIM):
+                res[i] = np.int8(0)
 
         return res
 
@@ -974,7 +1014,7 @@ class TorchInProcAgent:
         # 对每个候选动作生成“采取动作后”的手牌与其派生结构特征（统计量也要同步更新）。
         cur_rank_i = RANK[str(message['curRank'])]
         my_hand_after_batch = np.repeat(my_handcards[np.newaxis, :], num_legal_actions, axis=0)
-        universal_after_batch = np.zeros((num_legal_actions, 13), dtype=np.int8)
+        universal_after_batch = np.zeros((num_legal_actions, UNIVERSAL_DIM), dtype=np.int8)
         for j, (t, real_cards) in enumerate(zip(legal_actions_type, legal_actions_real)):
             if str(t).upper() != 'PASS':
                 played = card2array(real_cards)
@@ -1098,6 +1138,45 @@ class TorchInProcAgent:
             else:
                 rel_greater_after_batch[j, :] = self_is_greater
 
+                # 贡牌目标（不区分进贡/还贡）：[上家, 队友, 下家]
+                # - 非贡牌阶段：全 0
+                # - 贡牌阶段：若 toPos 明确，则对应位置为 1
+                # - 若目标不明确（例如“双下进贡”）：上家与下家都为 1
+                tribute_target = np.zeros(3, dtype=np.int8)
+                stage = str(message.get('stage', '')).lower()
+                if stage in {'tribute', 'back'}:
+                    up_pos = (int(self.mypos) + 3) % 4
+                    teammate_pos = (int(self.mypos) + 2) % 4
+                    down_pos = (int(self.mypos) + 1) % 4
+
+                    def _mark_to(p: int) -> None:
+                        if int(p) == int(up_pos):
+                            tribute_target[0] = 1
+                        elif int(p) == int(teammate_pos):
+                            tribute_target[1] = 1
+                        elif int(p) == int(down_pos):
+                            tribute_target[2] = 1
+
+                    to_pos = message.get('toPos', message.get('toSeat', message.get('targetPos')))
+                    if to_pos is not None and str(to_pos) != '':
+                        try:
+                            _mark_to(int(to_pos))
+                        except Exception:
+                            pass
+                    else:
+                        cand = message.get('toPosCandidates', message.get('toSeatCandidates', message.get('targetCandidates')))
+                        if isinstance(cand, list) and cand:
+                            for p in cand:
+                                try:
+                                    _mark_to(int(p))
+                                except Exception:
+                                    continue
+                        else:
+                            ambiguous = bool(message.get('toPosAmbiguous', message.get('ambiguousTo', message.get('doubleDown'))))
+                            if ambiguous:
+                                tribute_target[0] = 1
+                                tribute_target[2] = 1
+
         # 不可变状态块（与候选动作无关）：用于 actor 的“状态特征区”，以及 q 的公共部分。
         invariant = np.hstack(
             (
@@ -1118,6 +1197,7 @@ class TorchInProcAgent:
                 count_a,
                 count_a_self,
                 count_a_oppo,
+                tribute_target,
             )
         )
         invariant_batch = np.repeat(invariant[np.newaxis, :], num_legal_actions, axis=0).astype(np.int8)
@@ -1156,7 +1236,7 @@ class TorchInProcAgent:
         state_no_action = state['x_no_action']
         deck_universal = state.get('deck_universal')
         if deck_universal is None:
-            deck_universal = np.zeros((13,), dtype=np.float32)
+            deck_universal = np.zeros((UNIVERSAL_DIM,), dtype=np.float32)
 
         legal_action = 2
         legal_index = np.ones(legal_action, dtype=np.float32)
@@ -1193,7 +1273,7 @@ class TorchInProcAgent:
         用于离线回放/训练时复现“TopK候选动作特征拼接”的输入格式，同时允许
         将某个“指定动作”（例如人类真实选择）强制拼进候选集。
 
-        - obs_vec 形状：invariant(571) + action_number * variant(139) + deck_universal(13)
+        - obs_vec 形状：invariant(571) + action_number * variant + deck_universal
         - legal_mask 形状：(action_number,)，无效槽位为 0。
         """
 
@@ -1208,7 +1288,7 @@ class TorchInProcAgent:
         state_no_action = state['x_no_action']
         deck_universal = state.get('deck_universal')
         if deck_universal is None:
-            deck_universal = np.zeros((13,), dtype=np.float32)
+            deck_universal = np.zeros((UNIVERSAL_DIM,), dtype=np.float32)
 
         k = int(action_number)
         if k <= 0:
@@ -1280,7 +1360,7 @@ class TorchInProcAgent:
         state_no_action = state['x_no_action']
         deck_universal = state.get('deck_universal')
         if deck_universal is None:
-            deck_universal = np.zeros((13,), dtype=np.float32)
+            deck_universal = np.zeros((UNIVERSAL_DIM,), dtype=np.float32)
 
         if len(states) >= legal_action:
             indexs = self.player.model_q.get_max_n_index(states, legal_action)

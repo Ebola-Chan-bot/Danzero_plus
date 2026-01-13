@@ -2995,68 +2995,78 @@ async def main_async(args):
       # 2) 可选：让模型为 seat0 给出“进贡/还贡”的建议（用于你在真实牌局里参考）。
       # 注意：标准规则要求“进贡牌必须是手中最大的牌（红心参谋除外）”，因此多数情况下候选集很小。
       if _yes("让模型为 seat0 选择进贡牌（act(tribute)）？[y/N]: "):
-        to_s = input("请输入 seat0 进贡给谁（toSeat=0-3）：").strip()
-        to_pos = _parse_seat(to_s)
-        if to_pos is not None:
-          red_adviser = f"H{str(args.cur_rank)}"
-          candidates = [c for c in list(server.ai_hand) if c != red_adviser]
-          if not candidates:
-            candidates = [c for c in list(server.ai_hand)]
-          best = max((_tribute_strength(c, str(args.cur_rank)) for c in candidates), default=0)
-          best_cards = [c for c in candidates if _tribute_strength(c, str(args.cur_rank)) == best]
-          action_list = [["Single", "A", [c]] for c in best_cards]
-          msg = {
-            "type": "act",
-            "stage": "tribute",
-            "handCards": list(server.ai_hand),
-            "actionList": action_list,
-            "indexRange": len(action_list) - 1,
-            "curRank": server.cur_rank,
-            "selfRank": server.self_rank,
-            "oppoRank": server.oppo_rank,
-            "curPos": 0,
-            "curAction": None,
-            "greaterPos": -1,
-            "greaterAction": ["PASS", "PASS", []],
-          }
-          try:
-            idx = int(server.seat0_inproc_agent.act_tribute(msg))
-          except Exception:
-            idx = 0
-          idx = max(0, min(idx, len(action_list) - 1))
-          chosen = action_list[idx][2][0]
+        to_s = input("请输入 seat0 进贡给谁（toSeat=0-3；留空表示双下不明确）：").strip()
+        to_pos = _parse_seat(to_s) if to_s else None
+        red_adviser = f"H{str(args.cur_rank)}"
+        candidates = [c for c in list(server.ai_hand) if c != red_adviser]
+        if not candidates:
+          candidates = [c for c in list(server.ai_hand)]
+        best = max((_tribute_strength(c, str(args.cur_rank)) for c in candidates), default=0)
+        best_cards = [c for c in candidates if _tribute_strength(c, str(args.cur_rank)) == best]
+        action_list = [["Single", "A", [c]] for c in best_cards]
+        msg = {
+          "type": "act",
+          "stage": "tribute",
+          "handCards": list(server.ai_hand),
+          "actionList": action_list,
+          "indexRange": len(action_list) - 1,
+          "curRank": server.cur_rank,
+          "selfRank": server.self_rank,
+          "oppoRank": server.oppo_rank,
+          "curPos": 0,
+          "curAction": None,
+          "greaterPos": -1,
+          "greaterAction": ["PASS", "PASS", []],
+          "toPos": to_pos,
+          "toPosAmbiguous": (to_pos is None),
+          "toPosCandidates": ([1, 3] if to_pos is None else None),
+        }
+        try:
+          idx = int(server.seat0_inproc_agent.act_tribute(msg))
+        except Exception:
+          idx = 0
+        idx = max(0, min(idx, len(action_list) - 1))
+        chosen = action_list[idx][2][0]
+        if to_pos is None:
+          print(f"[inproc] 建议 seat0 进贡：{format_card_for_human(chosen)} -> (双下不明确)")
+        else:
           print(f"[inproc] 建议 seat0 进贡：{format_card_for_human(chosen)} -> Seat{to_pos}")
 
       if _yes("让模型为 seat0 选择还贡牌（act(back)）？[y/N]: "):
-        to_s = input("请输入 seat0 还贡给谁（toSeat=0-3）：").strip()
-        to_pos = _parse_seat(to_s)
-        if to_pos is not None:
-          # 规则：还给己方搭档必须是 10 以下(含10)；还给对方可任意。
-          need_leq10 = (to_pos == 2)
-          cand = [c for c in list(server.ai_hand) if (not need_leq10) or (_base_value(c) <= 10)]
-          if not cand:
-            cand = list(server.ai_hand)
-          action_list = [["Single", "A", [c]] for c in cand]
-          msg = {
-            "type": "act",
-            "stage": "back",
-            "handCards": list(server.ai_hand),
-            "actionList": action_list,
-            "indexRange": len(action_list) - 1,
-            "curRank": server.cur_rank,
-            "selfRank": server.self_rank,
-            "oppoRank": server.oppo_rank,
-            "curPos": 0,
-            "curAction": None,
-            "greaterPos": -1,
-            "greaterAction": ["PASS", "PASS", []],
-          }
-          try:
-            idx = int(server.seat0_inproc_agent.act_back(msg))
-          except Exception:
-            idx = 0
-          idx = max(0, min(idx, len(action_list) - 1))
-          chosen = action_list[idx][2][0]
+        to_s = input("请输入 seat0 还贡给谁（toSeat=0-3；留空表示双下不明确）：").strip()
+        to_pos = _parse_seat(to_s) if to_s else None
+        # 规则：还给己方搭档必须是 10 以下(含10)；还给对方可任意。
+        need_leq10 = (to_pos == 2)
+        cand = [c for c in list(server.ai_hand) if (not need_leq10) or (_base_value(c) <= 10)]
+        if not cand:
+          cand = list(server.ai_hand)
+        action_list = [["Single", "A", [c]] for c in cand]
+        msg = {
+          "type": "act",
+          "stage": "back",
+          "handCards": list(server.ai_hand),
+          "actionList": action_list,
+          "indexRange": len(action_list) - 1,
+          "curRank": server.cur_rank,
+          "selfRank": server.self_rank,
+          "oppoRank": server.oppo_rank,
+          "curPos": 0,
+          "curAction": None,
+          "greaterPos": -1,
+          "greaterAction": ["PASS", "PASS", []],
+          "toPos": to_pos,
+          "toPosAmbiguous": (to_pos is None),
+          "toPosCandidates": ([1, 3] if to_pos is None else None),
+        }
+        try:
+          idx = int(server.seat0_inproc_agent.act_back(msg))
+        except Exception:
+          idx = 0
+        idx = max(0, min(idx, len(action_list) - 1))
+        chosen = action_list[idx][2][0]
+        if to_pos is None:
+          print(f"[inproc] 建议 seat0 还贡：{format_card_for_human(chosen)} -> (双下不明确)")
+        else:
           print(f"[inproc] 建议 seat0 还贡：{format_card_for_human(chosen)} -> Seat{to_pos}")
 
     # 需求：模型推理出任何错误就让主线程/进程崩掉；这里不捕获异常。
