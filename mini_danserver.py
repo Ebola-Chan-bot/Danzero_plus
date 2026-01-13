@@ -56,6 +56,14 @@ Action = List  # [type, key, cards]
 # 全量重新开始（从选择级牌/先手/AI 手牌重新走）的跨线程信号。
 _RESTART_FULL_EVENT = threading.Event()
 
+# 连败加速学习：跨局累积的 reward 缩放因子。
+# 规则：
+# - 初始为 1
+# - 若本局 AI(seat0) reward < 0：累加其负分幅度（factor += -reward）
+# - 若本局 AI(seat0) reward > 0：重置为 1
+# - 本局所有人的 reward 统一乘以 factor 后再训练
+_LOSS_ACCEL_FACTOR: float = 1.0
+
 
 def _format_exc(e: BaseException) -> str:
   return "".join(traceback.format_exception(type(e), e, e.__traceback__))
@@ -498,6 +506,197 @@ def _run_yolo_on_image(
       return json.load(f)
 
 
+def _card_from_yolo_item(d: dict) -> Optional[Card]:
+  """将单个 yolo payload item 转成仓库 Card 编码（如 SA/HR）。
+
+  仅做字段解码；不做库存限制。
+  """
+
+  suit_map = {
+    "spades": "S",
+    "hearts": "H",
+    "clubs": "C",
+    "diamonds": "D",
+  }
+
+  label = str(d.get("label", ""))
+  rank = d.get("rank")
+  suit = d.get("suit")
+
+  if rank == "joker":
+    if label == "dw":
+      return "HR"
+    if label == "xw":
+      return "SB"
+    return None
+
+  if not rank or not suit:
+    return None
+  s = suit_map.get(str(suit), "")
+  r = str(rank)
+  if r == "10":
+    r = "T"
+  r = r.upper()
+  if s in {"S", "H", "C", "D"} and r in set(list("23456789TJQKA")):
+    return f"{s}{r}"
+  return None
+
+
+def _parse_yolo_corrections(text: str, *, max_id: int) -> Dict[int, Card]:
+  """解析纠错输入：形如 '3=♠A 7=小JOKER'。
+
+  返回 {index(0-based): Card}。
+  """
+
+  s = str(text or "").strip()
+  if not s:
+    return {}
+
+  parts = s.replace(",", " ").replace(";", " ").split()
+  out: Dict[int, Card] = {}
+  for p in parts:
+    if "=" not in p:
+      continue
+    left, right = p.split("=", 1)
+    left = left.strip()
+    right = right.strip()
+    if not left or not right:
+      continue
+    try:
+      i = int(left)
+    except Exception:
+      raise ValueError(f"编号无效: {left}")
+    if i < 1 or i > int(max_id):
+      raise ValueError(f"编号超出范围: {i}（有效范围 1-{int(max_id)}）")
+    cards = parse_ai_hand_text(right)
+    if len(cards) != 1:
+      raise ValueError(f"纠错牌面必须是 1 张：{right}")
+    out[int(i - 1)] = str(cards[0])
+  return out
+
+
+class _YoloReviewDialog:
+  """展示编号框+识别结果，并允许文本纠错。"""
+
+  def __init__(self, parent, pil_img, items: List[dict], *, title: str = "识别结果（编号可纠错）"):
+    import tkinter as tk
+    from tkinter import messagebox
+    from PIL import Image, ImageDraw, ImageFont, ImageTk
+
+    self._tk = tk
+    self._messagebox = messagebox
+    self._Image = Image
+    self._ImageDraw = ImageDraw
+    self._ImageFont = ImageFont
+    self._ImageTk = ImageTk
+
+    self._parent = parent
+    self._img = pil_img
+    self._items = list(items)
+    self._result: Optional[Dict[int, Card]] = None
+
+    top = tk.Toplevel(parent)
+    self.top = top
+    top.title(title)
+    top.attributes("-topmost", True)
+
+    tk.Label(top, text="每个框左上角是编号与识别结果。纠错输入格式： 3=♠A 7=小JOKER（空格分隔多个）").pack(
+      padx=10, pady=(10, 6), anchor="w"
+    )
+
+    self._img_label = tk.Label(top)
+    self._img_label.pack(padx=10, pady=(0, 8))
+
+    row = tk.Frame(top)
+    row.pack(padx=10, pady=(0, 10), fill="x")
+
+    tk.Label(row, text="纠错：").pack(side="left")
+    self._entry = tk.Entry(row)
+    self._entry.pack(side="left", fill="x", expand=True)
+
+    btns = tk.Frame(top)
+    btns.pack(padx=10, pady=(0, 10), fill="x")
+
+    tk.Button(btns, text="应用纠错", command=self._on_apply).pack(side="left")
+    tk.Button(btns, text="跳过", command=self._on_skip).pack(side="left", padx=(8, 0))
+
+    top.protocol("WM_DELETE_WINDOW", self._on_skip)
+
+    self._render_preview()
+    top.grab_set()
+
+  def _render_preview(self) -> None:
+    img = self._img.copy()
+    draw = self._ImageDraw.Draw(img)
+    try:
+      font = self._ImageFont.load_default()
+    except Exception:
+      font = None
+
+    for i, d in enumerate(self._items, start=1):
+      bbox = d.get("bbox")
+      if not (isinstance(bbox, list) and len(bbox) == 4):
+        continue
+      x1, y1, x2, y2 = [int(v) for v in bbox]
+      x1 = max(0, x1)
+      y1 = max(0, y1)
+      x2 = max(x1 + 1, x2)
+      y2 = max(y1 + 1, y2)
+      card = _card_from_yolo_item(d)
+      card_txt = format_card_for_human(card) if card else "?"
+      score = float(d.get("score", 0.0))
+      label = f"{i}:{card_txt} {score:.2f}"
+
+      draw.rectangle([x1, y1, x2, y2], outline="cyan", width=2)
+      # 简单底色条
+      tw, th = draw.textbbox((0, 0), label, font=font)[2:4] if hasattr(draw, "textbbox") else (len(label) * 6, 11)
+      draw.rectangle([x1, max(0, y1 - th - 2), x1 + tw + 4, y1], fill="black")
+      draw.text((x1 + 2, max(0, y1 - th - 1)), label, fill="white", font=font)
+
+    # 缩放到屏幕可见范围
+    try:
+      sw = int(self.top.winfo_screenwidth())
+      sh = int(self.top.winfo_screenheight())
+      max_w = max(600, int(sw * 0.7))
+      max_h = max(400, int(sh * 0.7))
+      iw, ih = img.size
+      scale = min(1.0, max_w / max(1, iw), max_h / max(1, ih))
+      if scale < 1.0:
+        img = img.resize((max(1, int(iw * scale)), max(1, int(ih * scale))))
+    except Exception:
+      pass
+
+    self._photo = self._ImageTk.PhotoImage(img)
+    self._img_label.configure(image=self._photo)
+
+  def _on_apply(self):
+    try:
+      corr = _parse_yolo_corrections(self._entry.get(), max_id=len(self._items))
+    except Exception as e:
+      self._messagebox.showerror("纠错格式错误", str(e))
+      return
+    self._result = corr
+    self._finish()
+
+  def _on_skip(self):
+    self._result = {}
+    self._finish()
+
+  def _finish(self):
+    try:
+      self.top.grab_release()
+    except Exception:
+      pass
+    try:
+      self.top.destroy()
+    except Exception:
+      pass
+
+  def run(self) -> Dict[int, Card]:
+    self._parent.wait_window(self.top)
+    return dict(self._result or {})
+
+
 class _PersistentHumanActionPicker:
   def __init__(self, *, cur_rank: str):
     import tkinter as tk
@@ -934,7 +1133,11 @@ class _PersistentHumanActionPicker:
       messagebox.showerror("识别失败", str(e))
       return
 
-    cards_ranked = _cards_from_yolo_payload(payload, target_count=None)
+    # 与 _cards_from_yolo_payload 保持一致：按 score 从高到低排序。
+    ranked_items = sorted(payload, key=lambda d: float(d.get("score", 0.0)), reverse=True)
+
+    # 对局内不做纠错：直接把识别结果转成 Card 列表，再按两副牌库存限制（每种最多 2）做一次去超。
+    cards_ranked = _cards_from_yolo_payload(ranked_items)
     if not cards_ranked:
       messagebox.showwarning("未识别到牌", "该区域未识别到任何牌，请重新框选或放大区域。")
       return
@@ -942,7 +1145,7 @@ class _PersistentHumanActionPicker:
     # AI 起手牌需要 27 张；人类出牌模式按 remaining 作为上限。
     if self._mode == "ai_hand":
       target = 27
-      cards_sel = _cards_from_yolo_payload(payload, target_count=27)
+      cards_sel = list(cards_ranked)[:27]
       dropped: List[Card] = []
     else:
       target = int(max(1, self.remaining))
@@ -3469,6 +3672,30 @@ async def main_async(args):
     order = getattr(server, "finish_order", [])
     events = _compute_inproc_training_events(order)
     events = [(int(s), float(r)) for (s, r) in events]
+
+    # 连败加速学习：按 seat0 的 reward 更新倍率，并缩放本局所有训练事件的 reward。
+    global _LOSS_ACCEL_FACTOR
+    try:
+      ai_rew = 0.0
+      for s, r in events:
+        if int(s) == 0:
+          ai_rew = float(r)
+          break
+
+      if float(ai_rew) > 0.0:
+        _LOSS_ACCEL_FACTOR = 1.0
+      elif float(ai_rew) < 0.0:
+        _LOSS_ACCEL_FACTOR = float(_LOSS_ACCEL_FACTOR) + float(-ai_rew)
+
+      factor = float(_LOSS_ACCEL_FACTOR)
+      if factor < 1.0:
+        factor = 1.0
+      if factor != 1.0:
+        print(f"[server] loss-accel: ai_rew={ai_rew} factor={factor}")
+      events = [(int(s), float(r) * factor) for (s, r) in events]
+    except Exception:
+      # 任何异常都不应影响训练/复盘。
+      pass
 
     try:
       trainer = server.seat0_inproc_agent

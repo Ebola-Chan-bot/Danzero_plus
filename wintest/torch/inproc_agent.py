@@ -138,7 +138,7 @@ def _adapt_actor_state_dict_for_obs_dim(weights: dict, target_obs_dim: int) -> d
     - 最新：904（invariant=574）
     - 次新：901（invariant=571）
 
-    更老版本（如 843/849/847 等）不再兼容：发现后直接报错，避免“加载成功但语义错位”。
+    更老版本（如 843/849/847 等）不再兼容：检测到后由调用方决定是否跳过加载。
     """
 
     if not isinstance(weights, dict):
@@ -338,13 +338,16 @@ class TorchInProcAgent:
         self.player = _InProcPlayer(args, actor_obs_dim=self._actor_obs_dim, q_obs_dim=self._q_obs_dim)
 
         # 可选：加载“进程内训练”产出的最新策略/价值网络权重。
-        if weights_override_path:
+        # 若维度不兼容：提示并继续运行（使用新建模型的随机初始化权重）。
+        if weights_override_path and os.path.exists(weights_override_path):
+            ok = False
             try:
-                self._load_actor_weights(weights_override_path)
-                if os.path.exists(weights_override_path):
-                    print(f"[inproc] loaded actor weights: {weights_override_path}")
-            except FileNotFoundError:
-                pass
+                ok = bool(self._load_actor_weights(weights_override_path))
+            except Exception as e:
+                ok = False
+                print(f"[inproc] skip actor override (will use fresh init): {e}")
+            if ok:
+                print(f"[inproc] loaded actor weights: {weights_override_path}")
 
         # 可选：加载“进程内训练”产出的最新 q 网络权重（state_dict 格式）。
         self._q_weights_override_path = q_weights_override_path
@@ -481,12 +484,22 @@ class TorchInProcAgent:
             except Exception:
                 pass
 
-    def _load_actor_weights(self, path: str):
+    def _load_actor_weights(self, path: str) -> bool:
+        """尝试加载 actor 权重。
+
+        返回 True 表示成功加载；返回 False 表示已跳过（例如维度不兼容）。
+        """
+
         weights = self._torch_load_cpu(path)
         if not isinstance(weights, dict):
             raise TypeError(f"unexpected weights type: {type(weights).__name__}")
-        weights = _adapt_actor_state_dict_for_obs_dim(weights, int(self._actor_obs_dim))
-        self.player.model.set_weights(weights)
+        try:
+            weights = _adapt_actor_state_dict_for_obs_dim(weights, int(self._actor_obs_dim))
+            self.player.model.set_weights(weights)
+            return True
+        except Exception as e:
+            print(f"[inproc] skip actor override (will use fresh init): {e}")
+            return False
 
     def save_actor_weights(self, path: str):
         # 仅保存策略/价值网络权重；q 网络权重另存。
@@ -793,6 +806,12 @@ class TorchInProcAgent:
         - 6 维“最长连顺窗口”：单顺/双顺/三顺分别给出 (长度, 平均大小)。
           允许缺 1 张当且仅当手里有参谋（参谋视为万能补缺）。
 
+                    额外约定：长度特征做平移截断（更关注“超过最低门槛”的部分）：
+                    - 单顺：max(0, len - 4)
+                    - 双顺：max(0, len - 2)
+                    - 三顺：max(0, len - 1)
+                    若长度特征为 0，则对应平均大小也记为 0。
+
         - rank 是 1..13（2..A），用于定位“参谋(级牌)”的位置并在统计时排除。
         """
 
@@ -978,8 +997,15 @@ class TorchInProcAgent:
 
             for idx, k in enumerate((1, 2, 3)):
                 l, a = _best_seq_stats(int(k))
-                res[20 + idx * 2] = np.int8(min(30, max(0, int(l))))
-                res[21 + idx * 2] = np.int8(min(30, max(0, int(a))))
+                # 按用户约定对长度做“减门槛并截断”，并在无效时清零均值。
+                offset = 4 if int(k) == 1 else (2 if int(k) == 2 else 1)
+                l_feat = max(0, int(l) - int(offset))
+                if l_feat <= 0:
+                    a_feat = 0
+                else:
+                    a_feat = int(a)
+                res[20 + idx * 2] = np.int8(min(30, max(0, int(l_feat))))
+                res[21 + idx * 2] = np.int8(min(30, max(0, int(a_feat))))
         except Exception:
             for i in range(12, UNIVERSAL_DIM):
                 res[i] = np.int8(0)
@@ -1273,7 +1299,7 @@ class TorchInProcAgent:
         用于离线回放/训练时复现“TopK候选动作特征拼接”的输入格式，同时允许
         将某个“指定动作”（例如人类真实选择）强制拼进候选集。
 
-        - obs_vec 形状：invariant(571) + action_number * variant + deck_universal
+        - obs_vec 形状：invariant(574) + action_number * variant(152) + deck_universal(26)
         - legal_mask 形状：(action_number,)，无效槽位为 0。
         """
 
@@ -1478,12 +1504,32 @@ class TorchInProcAgent:
         if not trajectory:
             return {"loss": 0.0, "n": 0}
 
+        # 跳过“只有一个合法动作”的 step：
+        # - 这类 step 的策略梯度恒为 0（logp=0），基本无训练价值
+        # - 用户期望直接忽略
+        filtered: List[Tuple[np.ndarray, np.ndarray, int]] = []
+        for obs_i, legal_i, act_i in trajectory:
+            try:
+                legal_arr = np.asarray(legal_i, dtype=np.float32).reshape(-1)
+                n_legal = int(np.sum(legal_arr > 0.5))
+            except Exception:
+                n_legal = 0
+            if n_legal <= 1:
+                continue
+            filtered.append((obs_i, legal_i, int(act_i)))
+
+        if clear:
+            trajectory.clear()
+
+        if not filtered:
+            return {"loss": 0.0, "n": 0}
+
         optimizer = torch.optim.Adam(self.player.model.parameters(), lr=lr)
         optimizer.zero_grad()
 
-        obs = torch.tensor(np.stack([t[0] for t in trajectory]), dtype=torch.float32)
-        legal = torch.tensor(np.stack([t[1] for t in trajectory]), dtype=torch.float32)
-        act = torch.tensor([t[2] for t in trajectory], dtype=torch.long)
+        obs = torch.tensor(np.stack([t[0] for t in filtered]), dtype=torch.float32)
+        legal = torch.tensor(np.stack([t[1] for t in filtered]), dtype=torch.float32)
+        act = torch.tensor([t[2] for t in filtered], dtype=torch.long)
 
         # 前向：策略输出 + 价值函数
         shared = self.player.model.shared(obs)
@@ -1497,7 +1543,7 @@ class TorchInProcAgent:
         # GAE（与全自动版本默认超参一致）
         gamma = 0.99
         lam = 0.95
-        t = int(len(trajectory))
+        t = int(len(filtered))
         rewards = torch.zeros(t, dtype=torch.float32)
         dones = torch.zeros(t, dtype=torch.float32)
         rewards[-1] = float(reward)
@@ -1521,7 +1567,5 @@ class TorchInProcAgent:
         loss.backward()
         optimizer.step()
 
-        n = int(len(trajectory))
-        if clear:
-            trajectory.clear()
+        n = int(len(filtered))
         return {"loss": float(loss.detach().cpu().item()), "n": n}
