@@ -1016,6 +1016,66 @@ class TorchInProcAgent:
         obs_vec = np.concatenate((obs_vec, supple))
         return obs_vec.astype(np.float32), legal_index.astype(np.float32), indexs
 
+    def build_obs_for_message_with_candidates(
+        self,
+        message: Dict[str, Any],
+        candidate_action_indices: List[int],
+        *,
+        action_number: int = 2,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """为 play 消息构造 (obs_vec, legal_mask)，但候选动作由调用方显式指定。
+
+        用于离线回放/训练时复现“TopK候选动作特征拼接”的输入格式，同时允许
+        将某个“指定动作”（例如人类真实选择）强制拼进候选集。
+
+        - obs_vec 形状：invariant(571) + action_number * variant(138)
+        - legal_mask 形状：(action_number,)，无效槽位为 0。
+        """
+
+        if self.flag == 0:
+            init_hand = card2num(message['handCards'])
+            for ele in init_hand:
+                self.other_left_hands[ele] -= 1
+            self.flag = 1
+
+        state = self.prepare(message)
+        states = state['x_batch']
+        state_no_action = state['x_no_action']
+
+        k = int(action_number)
+        if k <= 0:
+            return state_no_action.astype(np.float32), np.zeros((0,), dtype=np.float32)
+
+        legal_mask = np.zeros((k,), dtype=np.float32)
+        variants: List[np.ndarray] = []
+
+        n_actions = int(states.shape[0]) if isinstance(states, np.ndarray) and states.ndim == 2 else 0
+        used: List[int] = []
+
+        for slot in range(k):
+            idx = None
+            try:
+                idx = int(candidate_action_indices[slot])
+            except Exception:
+                idx = None
+
+            if idx is None or idx < 0 or idx >= n_actions:
+                variants.append(np.zeros((int(self._variant_dim),), dtype=np.float32))
+                continue
+
+            # 避免重复候选导致 PPO 动作空间退化：第二个槽位若与前面重复，则标记为无效并置 0。
+            if idx in used:
+                variants.append(np.zeros((int(self._variant_dim),), dtype=np.float32))
+                continue
+
+            used.append(idx)
+            legal_mask[slot] = 1.0
+            v = states[idx, int(self._invariant_dim) :].astype(np.float32, copy=False)
+            variants.append(v)
+
+        obs_vec = np.concatenate([state_no_action.astype(np.float32, copy=False)] + variants)
+        return obs_vec.astype(np.float32), legal_mask.astype(np.float32)
+
     def act_play(self, message: Dict[str, Any]) -> int:
         """处理 act(play) 消息并返回 actIndex。"""
         return self._act_generic(message, record=True)

@@ -3129,6 +3129,17 @@ async def main_async(args):
               if chosen_idx in top_indexs:
                 chosen = int(top_indexs.index(chosen_idx))
                 traj.append((obs_vec, legal_mask, chosen))
+              else:
+                # 人类动作不在 q_network 的 Top2：改为拼接 [q_top1, human_action] 交给 PPO。
+                # 这样可以避免样本被丢弃，同时仍保持“两个候选动作”的输入格式。
+                try:
+                  top1 = int(top_indexs[0]) if top_indexs else 0
+                except Exception:
+                  top1 = 0
+                obs2, legal2 = agent.build_obs_for_message_with_candidates(msg, [top1, int(chosen_idx)])
+                # 若两个候选动作重复/无效，则第二槽位会被置为 illegal；此时只能选 0。
+                chosen2 = 1 if float(legal2[1]) > 0.0 and int(chosen_idx) != int(top1) else 0
+                traj.append((obs2, legal2, int(chosen2)))
             except Exception:
               pass
 
